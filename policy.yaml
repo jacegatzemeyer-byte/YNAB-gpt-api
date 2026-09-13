@@ -1,0 +1,15 @@
+policy_version: 1.0
+cash:
+  primary_checking_alias: "acct:checking"
+  minimum_floor: 1000.00
+category_classes:
+  essentials:
+    - "cat:mortgage"
+    - "cat:groceries"
+    - "cat:utilities"
+  discretionary:
+    - "cat:dining"
+    - "cat:entertainment"
+merchant_rules:
+  Netflix: "cat:streaming"
+  Spotify: "cat:streaming"
