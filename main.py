@@ -51,7 +51,7 @@ YNAB_BASE_URL = "https://api.ynab.com/v1"
 app = FastAPI(
     title="YNAB Copilot Middleware",
     description="Deterministic read-model and guarded write layer between ChatGPT and YNAB",
-    version="2.0.0",
+    version="3.0.0",
 )
 
 
@@ -150,6 +150,7 @@ class BudgetStore:
         self.category_groups: Dict[str, dict] = {}
         self.transactions: Dict[str, dict] = {}
         self.scheduled_transactions: Dict[str, dict] = {}
+        self.payees: Dict[str, dict] = {}
         self.current_month_detail: Dict[str, Any] = {}
 
         self.alias_to_uuid: Dict[str, str] = {}
@@ -568,6 +569,13 @@ async def sync_ynab(force: bool = False):
                 store.categories[cat_id] = cat
                 store.register_alias("cat", cat.get("name") or "category", cat_id)
 
+        for payee in budget.get("payees", []):
+            payee_id = payee["id"]
+            if payee.get("deleted", False):
+                store.payees.pop(payee_id, None)
+                continue
+            store.payees[payee_id] = payee
+
         for stx in budget.get("scheduled_transactions", []):
             stx_id = stx["id"]
             if stx.get("deleted", False):
@@ -621,6 +629,199 @@ def current_month_categories() -> Dict[str, dict]:
         cat["id"]: cat
         for cat in store.current_month_detail.get("categories", [])
         if not cat.get("deleted", False) and not cat.get("hidden", False)
+    }
+
+
+
+# =====================================================================
+# Forecasting & Reallocation Helpers
+# =====================================================================
+
+DEFAULT_REALLOCATION_PRIORITY = [
+    "discretionary",
+    "flexible_essential",
+    "true_expense",
+    "savings",
+    "unclassified",
+]
+DEFAULT_PROTECTED_REALLOCATION_CLASSES = {
+    "essential",
+    "debt",
+    "credit_card_payment",
+    "business",
+    "internal",
+}
+
+
+def reallocation_policy(policy: Dict[str, Any]) -> tuple[List[str], set[str]]:
+    priority = policy.get("reallocation_priority")
+    if not isinstance(priority, list) or not priority:
+        priority = DEFAULT_REALLOCATION_PRIORITY
+
+    protected = policy.get("protected_reallocation_classes")
+    if not isinstance(protected, list):
+        protected_set = set(DEFAULT_PROTECTED_REALLOCATION_CLASSES)
+    else:
+        protected_set = {str(x) for x in protected}
+
+    return [str(x) for x in priority], protected_set
+
+
+def transfer_payee_id_for_account(account_id: str) -> Optional[str]:
+    """Return YNAB's special transfer payee for a target account, if present."""
+    for payee_id, payee in store.payees.items():
+        if payee.get("transfer_account_id") == account_id and not payee.get("deleted", False):
+            return payee_id
+    return None
+
+
+def credit_card_account_ids() -> set[str]:
+    return {
+        acct_id
+        for acct_id, acct in store.accounts.items()
+        if not acct.get("closed")
+        and str(acct.get("type") or "").lower() == "creditcard"
+        and bool(acct.get("on_budget", True))
+    }
+
+
+def scheduled_event_payload(stx_id: str, stx: dict, event_type: str) -> dict:
+    return {
+        "ref": store.scheduled_ref(stx_id),
+        "date": stx.get("date_next"),
+        "payee": stx.get("payee_name") or "Scheduled transaction",
+        "account": store.uuid_to_alias.get(
+            stx.get("account_id", ""), stx.get("account_name", "")
+        ),
+        "amount_milli": int(stx.get("amount", 0)),
+        "frequency": stx.get("frequency") or "never",
+        "event_type": event_type,
+    }
+
+
+def build_reallocation_plan(
+    target_category: str,
+    amount_milli: Optional[int] = None,
+    include_protected: bool = False,
+) -> Dict[str, Any]:
+    policy = load_policy()
+    month_cats = current_month_categories()
+    target_uuid = store.resolve_uuid(target_category)
+    target = month_cats.get(target_uuid)
+    if not target:
+        raise HTTPException(status_code=404, detail=f"Category {target_category} not found")
+
+    target_alias = category_alias(target_uuid)
+    target_available = int(target.get("balance", 0))
+    if amount_milli is None:
+        if target_available >= 0:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{target_alias} is not overspent; provide an explicit amount "
+                    "to plan a proactive reallocation"
+                ),
+            )
+        amount_milli = abs(target_available)
+
+    if amount_milli <= 0:
+        raise HTTPException(status_code=422, detail="Reallocation amount must be positive")
+
+    priority, protected_classes = reallocation_policy(policy)
+    rank = {cls: i for i, cls in enumerate(priority)}
+    candidates = []
+
+    for cat_id, cat in month_cats.items():
+        if cat_id == target_uuid:
+            continue
+        available = int(cat.get("balance", 0))
+        if available <= 0:
+            continue
+
+        alias = category_alias(cat_id)
+        cls = policy_class_for(alias, policy)
+        if cls == "internal":
+            continue
+        if cls in protected_classes and not include_protected:
+            continue
+
+        # A category that is currently underfunded against its YNAB goal is a
+        # weaker donor than one with surplus beyond its goal requirement.
+        goal_under_funded = int(cat.get("goal_under_funded") or 0)
+        goal_warning = goal_under_funded > 0
+
+        candidates.append({
+            "category": alias,
+            "name": cat.get("name") or alias,
+            "class": cls,
+            "available_milli": available,
+            "goal_under_funded_milli": goal_under_funded,
+            "goal_warning": goal_warning,
+            "rank": rank.get(cls, len(rank) + 10),
+        })
+
+    candidates.sort(
+        key=lambda x: (
+            x["rank"],
+            x["goal_warning"],  # prefer fully funded categories
+            -x["available_milli"],
+            x["name"].lower(),
+        )
+    )
+
+    remaining = amount_milli
+    plan = []
+    for row in candidates:
+        if remaining <= 0:
+            break
+        take = min(row["available_milli"], remaining)
+        if take <= 0:
+            continue
+        plan.append({
+            "category": row["category"],
+            "name": row["name"],
+            "class": row["class"],
+            "available_before": milli_to_str(row["available_milli"]),
+            "recommended_subtract": milli_to_str(take),
+            "available_after": milli_to_str(row["available_milli"] - take),
+            "goal_under_funded": milli_to_str(row["goal_under_funded_milli"]),
+            "warnings": (
+                ["category is currently underfunded against its YNAB goal"]
+                if row["goal_warning"] else []
+            ),
+        })
+        remaining -= take
+
+    return {
+        "target_category": target_alias,
+        "target_name": target.get("name") or target_alias,
+        "target_class": policy_class_for(target_alias, policy),
+        "target_available_before": milli_to_str(target_available),
+        "amount_requested": milli_to_str(amount_milli),
+        "fully_funded": remaining == 0,
+        "shortfall": milli_to_str(remaining),
+        "target_available_after": milli_to_str(target_available + (amount_milli - remaining)),
+        "include_protected": include_protected,
+        "protected_classes": sorted(protected_classes),
+        "sources": plan,
+        "assignment_changes": (
+            [
+                {
+                    "category": p["category"],
+                    "operation": "subtract",
+                    "amount": p["recommended_subtract"],
+                }
+                for p in plan
+            ]
+            + (
+                [{
+                    "category": target_alias,
+                    "operation": "add",
+                    "amount": milli_to_str(amount_milli - remaining),
+                }]
+                if amount_milli - remaining > 0 else []
+            )
+        ),
     }
 
 
@@ -1080,7 +1281,7 @@ async def get_merchant_history(name: str):
 
 @app.get(
     "/ynab/cashflow",
-    summary="Checking-only scheduled cashflow forecast with coverage diagnostics",
+    summary="Checking cashflow forecast with credit-card liability exposure",
     operation_id="getCashflow",
 )
 async def get_cashflow(days: int = Query(30, ge=7, le=90)):
@@ -1089,6 +1290,7 @@ async def get_cashflow(days: int = Query(30, ge=7, le=90)):
     today = local_today()
     end_date = today + timedelta(days=days)
     checking_ids = get_primary_checking_ids()
+    card_ids = credit_card_account_ids()
 
     if not checking_ids:
         raise HTTPException(status_code=500, detail="Primary checking account not found")
@@ -1098,12 +1300,20 @@ async def get_cashflow(days: int = Query(30, ge=7, le=90)):
         for acct_id in checking_ids
     )
 
-    events = []
-    unexpanded_recurring = []
-    for stx_id, stx in store.scheduled_transactions.items():
-        if stx.get("account_id") not in checking_ids:
-            continue
+    # Existing credit-card debt is future cash exposure even when the actual
+    # checking payment has not yet been scheduled. We report it separately and
+    # in a conservative liquidity-adjusted scenario rather than pretending it
+    # is already a dated checking outflow.
+    starting_card_debt_milli = sum(
+        max(0, -int(store.accounts[acct_id].get("balance", 0)))
+        for acct_id in card_ids
+    )
 
+    checking_events = []
+    card_events = []
+    unexpanded_recurring = []
+
+    for stx_id, stx in store.scheduled_transactions.items():
         d_str = stx.get("date_next")
         if not d_str:
             continue
@@ -1111,29 +1321,31 @@ async def get_cashflow(days: int = Query(30, ge=7, le=90)):
         if not (today <= next_date <= end_date):
             continue
 
-        frequency = stx.get("frequency") or "never"
-        if frequency != "never":
-            # We intentionally do not synthesize future recurrences from one API row.
-            # The result therefore reports incomplete coverage instead of false confidence.
+        account_id = stx.get("account_id")
+        if account_id in checking_ids:
+            event = scheduled_event_payload(stx_id, stx, "checking")
+            checking_events.append(event)
+        elif account_id in card_ids:
+            event = scheduled_event_payload(stx_id, stx, "credit_card")
+            card_events.append(event)
+        else:
+            continue
+
+        if (stx.get("frequency") or "never") != "never":
+            # Recurring rows are not synthesized beyond date_next. Surface
+            # coverage limits rather than creating false precision.
             unexpanded_recurring.append(store.scheduled_ref(stx_id))
 
-        events.append({
-            "ref": store.scheduled_ref(stx_id),
-            "date": d_str,
-            "payee": stx.get("payee_name") or "Scheduled transaction",
-            "amount_milli": int(stx.get("amount", 0)),
-            "frequency": frequency,
-        })
-
-    events.sort(key=lambda x: (x["date"], x["ref"]))
+    checking_events.sort(key=lambda x: (x["date"], x["ref"]))
+    card_events.sort(key=lambda x: (x["date"], x["ref"]))
 
     running = starting_milli
     lowest = starting_milli
     inflows = 0
     outflows = 0
-    rendered_events = []
+    rendered_checking = []
 
-    for event in events:
+    for event in checking_events:
         amount = event["amount_milli"]
         running += amount
         lowest = min(lowest, running)
@@ -1142,51 +1354,151 @@ async def get_cashflow(days: int = Query(30, ge=7, le=90)):
         else:
             outflows += abs(amount)
 
-        rendered_events.append({
+        rendered_checking.append({
             "ref": event["ref"],
             "date": event["date"],
             "payee": event["payee"],
+            "account": event["account"],
             "amount": milli_to_str(amount),
             "frequency": event["frequency"],
             "projected_balance_after": milli_to_str(running),
         })
 
-    buffer_milli = lowest - CHECKING_FLOOR_MILLI
-    base_risk = "breached" if buffer_milli < 0 else "tight" if buffer_milli < 300_000 else "comfortable"
+    # Card purchases increase future cash liability; card inflows/payments reduce it.
+    scheduled_card_purchases = sum(
+        abs(e["amount_milli"]) for e in card_events if e["amount_milli"] < 0
+    )
+    scheduled_card_credits_or_payments = sum(
+        e["amount_milli"] for e in card_events if e["amount_milli"] > 0
+    )
+    projected_card_debt_end = max(
+        0,
+        starting_card_debt_milli
+        + scheduled_card_purchases
+        - scheduled_card_credits_or_payments,
+    )
+
+    rendered_card = [
+        {
+            "ref": e["ref"],
+            "date": e["date"],
+            "payee": e["payee"],
+            "account": e["account"],
+            "amount": milli_to_str(e["amount_milli"]),
+            "frequency": e["frequency"],
+            "liability_effect": (
+                "increase" if e["amount_milli"] < 0 else "decrease"
+            ),
+        }
+        for e in card_events
+    ]
+
+    checking_buffer_milli = lowest - CHECKING_FLOOR_MILLI
+
+    # Conservative scenario: if all projected card debt had to be paid from
+    # primary checking within the forecast window, what would remain?
+    conservative_lowest = lowest - projected_card_debt_end
+    conservative_buffer = conservative_lowest - CHECKING_FLOOR_MILLI
+
+    if conservative_buffer < 0:
+        risk = "breached"
+    elif conservative_buffer < 300_000:
+        risk = "tight"
+    else:
+        risk = "comfortable"
 
     coverage_complete = len(unexpanded_recurring) == 0
-    if not events:
+    if not checking_events and not card_events:
         risk = "insufficient_data"
-    elif not coverage_complete and base_risk != "breached":
+    elif not coverage_complete and risk != "breached":
         risk = "incomplete"
-    else:
-        risk = base_risk
 
     return {
         "forecast_days": days,
         "starting_checking": milli_to_str(starting_milli),
+        "known_checking_inflows": milli_to_str(inflows),
+        "known_checking_outflows": milli_to_str(outflows),
+        # Backward-compatible fields.
         "known_inflows": milli_to_str(inflows),
         "known_outflows": milli_to_str(outflows),
+        "lowest_projected_checking": milli_to_str(lowest),
         "lowest_projected_balance": milli_to_str(lowest),
         "checking_floor": milli_to_str(CHECKING_FLOOR_MILLI),
-        "minimum_buffer": milli_to_str(buffer_milli),
+        "checking_only_buffer": milli_to_str(checking_buffer_milli),
+        "minimum_buffer": milli_to_str(conservative_buffer),
+        "credit_cards": {
+            "starting_debt": milli_to_str(starting_card_debt_milli),
+            "scheduled_purchases": milli_to_str(scheduled_card_purchases),
+            "scheduled_credits_or_payments": milli_to_str(scheduled_card_credits_or_payments),
+            "projected_debt_end": milli_to_str(projected_card_debt_end),
+        },
+        "conservative_liquidity": {
+            "assumption": "all projected credit-card debt is paid from primary checking within the forecast window",
+            "lowest_after_card_debt": milli_to_str(conservative_lowest),
+            "buffer_above_floor": milli_to_str(conservative_buffer),
+        },
         "risk": risk,
         "coverage_complete": coverage_complete,
-        "scheduled_event_count": len(events),
-        "unexpanded_recurring_refs": unexpanded_recurring,
-        "events": rendered_events,
+        "scheduled_checking_event_count": len(checking_events),
+        "scheduled_card_event_count": len(card_events),
+        "scheduled_event_count": len(checking_events) + len(card_events),
+        "unexpanded_recurring_refs": sorted(set(unexpanded_recurring)),
+        "events": rendered_checking,
+        "credit_card_events": rendered_card,
     }
+
+
+@app.get(
+    "/ynab/reallocation-options",
+    summary="Policy-aware funding sources for a category shortfall or planned reallocation",
+    operation_id="getFundingOptions",
+)
+async def get_funding_options(
+    target: str = Query(..., description="Target category alias"),
+    amount: Optional[str] = Query(
+        None,
+        description="Optional positive amount. If omitted, covers the target's current overspending.",
+    ),
+    include_protected: bool = Query(False),
+):
+    await sync_ynab()
+    amount_milli = str_to_milli(amount) if amount is not None else None
+    return build_reallocation_plan(
+        target_category=target,
+        amount_milli=amount_milli,
+        include_protected=include_protected,
+    )
 
 
 # =====================================================================
 # Proposal Models & Guarded Writes
 # =====================================================================
 
+class SplitChangeItem(BaseModel):
+    category: str = Field(..., description="Category alias for this split line")
+    amount: str = Field(
+        ...,
+        description="Signed decimal amount; split amounts must sum exactly to the parent transaction amount",
+    )
+    memo: Optional[str] = None
+
+
 class TransactionChangeItem(BaseModel):
     ref: str = Field(..., description="Opaque transaction ref, e.g. t:abc123")
-    category: Optional[str] = Field(None, description="Target category alias")
+    operation: Literal["update", "delete", "split", "transfer"] = "update"
+    category: Optional[str] = Field(None, description="Target category alias for update")
     memo: Optional[str] = Field(None, description="Memo to set")
     approve: bool = True
+    transfer_account: Optional[str] = Field(
+        None,
+        description="Target account alias for transfer operations",
+    )
+    splits: Optional[List[SplitChangeItem]] = Field(
+        None,
+        min_length=2,
+        max_length=20,
+        description="Split lines for split operations",
+    )
 
 
 class TransactionProposalPayload(BaseModel):
@@ -1205,12 +1517,16 @@ class AssignmentProposalPayload(BaseModel):
 
 class TransactionProposalSummary(BaseModel):
     ref: str
+    operation: Literal["update", "delete", "split", "transfer"]
     payee: str
     amount: str
     current_category: str
     target_category: str
     proposed_memo: Optional[str] = None
     approve: bool
+    transfer_account: Optional[str] = None
+    splits: Optional[List[Dict[str, str]]] = None
+    warnings: List[str] = Field(default_factory=list)
 
 
 class TransactionProposalResponse(BaseModel):
@@ -1272,7 +1588,7 @@ def get_live_proposal(proposal_id: str) -> dict:
 
 @app.post(
     "/ynab/transactions/propose",
-    summary="Stage transaction changes for explicit review before commit",
+    summary="Stage transaction updates, deletes, splits, or transfers for explicit review",
     operation_id="proposeTransactions",
     response_model=TransactionProposalResponse,
 )
@@ -1283,6 +1599,7 @@ async def propose_transaction_changes(payload: TransactionProposalPayload):
 
     transfer_candidates = build_transfer_candidate_map(store.transactions)
     duplicate_candidates = build_duplicate_candidate_map(store.transactions)
+    month_cats = current_month_categories()
 
     for item in payload.changes:
         tx_uuid = store.resolve_uuid(item.ref)
@@ -1290,65 +1607,272 @@ async def propose_transaction_changes(payload: TransactionProposalPayload):
         if not tx:
             raise HTTPException(status_code=404, detail=f"Transaction {item.ref} not found")
 
-        if item.category and tx_uuid in duplicate_candidates:
-            candidate = duplicate_candidates[tx_uuid]
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"{item.ref} is a possible duplicate of "
-                    f"{candidate['candidate_ref']}; resolve the duplicate before categorizing"
-                ),
-            )
-
-        if item.category and tx_uuid in transfer_candidates and not tx_is_transfer(tx):
-            candidate = transfer_candidates[tx_uuid]
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"{item.ref} is a possible transfer paired with "
-                    f"{candidate['candidate_ref']}; resolve the transfer before categorizing"
-                ),
-            )
-
-        if item.category and tx_is_transfer(tx):
-            raise HTTPException(
-                status_code=409,
-                detail=f"{item.ref} is a transfer; category changes are not permitted",
-            )
-        if item.category and tx.get("subtransactions"):
-            raise HTTPException(
-                status_code=409,
-                detail=f"{item.ref} is a split transaction; parent category cannot be replaced",
-            )
-
+        operation = item.operation
         old_cat_id = tx.get("category_id")
-        target_cat_uuid = old_cat_id
-        if item.category is not None:
-            target_cat_uuid = store.resolve_uuid(item.category)
-            if target_cat_uuid not in current_month_categories():
+        warnings: List[str] = []
+
+        if operation == "update":
+            if item.transfer_account is not None or item.splits is not None:
                 raise HTTPException(
-                    status_code=404,
-                    detail=f"Category {item.category} not found in current month",
+                    status_code=422,
+                    detail=f"{item.ref}: transfer_account/splits require transfer or split operation",
                 )
 
-        verified.append({
-            "ref": item.ref,
-            "real_tx_id": tx_uuid,
-            "payee": tx_display_payee(tx),
-            "amount": milli_to_str(int(tx.get("amount", 0))),
-            "current_category": category_alias(old_cat_id) or "Uncategorized",
-            "target_category": item.category or category_alias(old_cat_id) or "Uncategorized",
-            "target_category_uuid": target_cat_uuid,
-            "new_memo": item.memo if item.memo is not None else tx.get("memo"),
-            "approve": item.approve,
-            "expected": {
-                "date": tx.get("date"),
-                "amount": int(tx.get("amount", 0)),
-                "category_id": old_cat_id,
-                "memo": tx.get("memo"),
-                "approved": bool(tx.get("approved")),
-            },
-        })
+            if item.category and tx_uuid in duplicate_candidates:
+                candidate = duplicate_candidates[tx_uuid]
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{item.ref} is a possible duplicate of "
+                        f"{candidate['candidate_ref']}; resolve the duplicate before categorizing"
+                    ),
+                )
+
+            if item.category and tx_uuid in transfer_candidates and not tx_is_transfer(tx):
+                candidate = transfer_candidates[tx_uuid]
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{item.ref} is a possible transfer paired with "
+                        f"{candidate['candidate_ref']}; resolve the transfer before categorizing"
+                    ),
+                )
+
+            if item.category and tx_is_transfer(tx):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{item.ref} is a transfer; category changes are not permitted",
+                )
+            if item.category and tx.get("subtransactions"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{item.ref} is a split transaction; parent category cannot be replaced",
+                )
+
+            target_cat_uuid = old_cat_id
+            if item.category is not None:
+                target_cat_uuid = store.resolve_uuid(item.category)
+                if target_cat_uuid not in month_cats:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Category {item.category} not found in current month",
+                    )
+
+            verified.append({
+                "ref": item.ref,
+                "operation": operation,
+                "real_tx_id": tx_uuid,
+                "payee": tx_display_payee(tx),
+                "amount": milli_to_str(int(tx.get("amount", 0))),
+                "current_category": category_alias(old_cat_id) or "Uncategorized",
+                "target_category": item.category or category_alias(old_cat_id) or "Uncategorized",
+                "target_category_uuid": target_cat_uuid,
+                "new_memo": item.memo if item.memo is not None else tx.get("memo"),
+                "approve": item.approve,
+                "transfer_account": None,
+                "transfer_account_uuid": None,
+                "transfer_payee_id": None,
+                "splits": None,
+                "warnings": warnings,
+                "expected": {
+                    "date": tx.get("date"),
+                    "amount": int(tx.get("amount", 0)),
+                    "category_id": old_cat_id,
+                    "memo": tx.get("memo"),
+                    "approved": bool(tx.get("approved")),
+                    "payee_id": tx.get("payee_id"),
+                    "is_split": bool(tx.get("subtransactions")),
+                },
+            })
+            continue
+
+        if operation == "delete":
+            if item.category is not None or item.transfer_account is not None or item.splits is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{item.ref}: delete operation cannot include category, transfer_account, or splits",
+                )
+            if tx_is_transfer(tx):
+                warnings.append("deleting one side of a transfer may affect the linked transfer transaction")
+            if tx_uuid not in duplicate_candidates:
+                warnings.append("transaction is not currently flagged as a possible duplicate")
+
+            verified.append({
+                "ref": item.ref,
+                "operation": operation,
+                "real_tx_id": tx_uuid,
+                "payee": tx_display_payee(tx),
+                "amount": milli_to_str(int(tx.get("amount", 0))),
+                "current_category": category_alias(old_cat_id) or "Uncategorized",
+                "target_category": "DELETE",
+                "target_category_uuid": None,
+                "new_memo": tx.get("memo"),
+                "approve": item.approve,
+                "transfer_account": None,
+                "transfer_account_uuid": None,
+                "transfer_payee_id": None,
+                "splits": None,
+                "warnings": warnings,
+                "expected": {
+                    "date": tx.get("date"),
+                    "amount": int(tx.get("amount", 0)),
+                    "category_id": old_cat_id,
+                    "memo": tx.get("memo"),
+                    "approved": bool(tx.get("approved")),
+                    "payee_id": tx.get("payee_id"),
+                    "is_split": bool(tx.get("subtransactions")),
+                },
+            })
+            continue
+
+        if operation == "split":
+            if tx_is_transfer(tx):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{item.ref} is already a transfer and cannot be converted to a split",
+                )
+            if tx.get("subtransactions"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{item.ref} is already split; YNAB's public API does not support "
+                        "updating existing split lines"
+                    ),
+                )
+            if not item.splits:
+                raise HTTPException(status_code=422, detail=f"{item.ref}: split operation requires splits")
+            if item.category is not None or item.transfer_account is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{item.ref}: split operation cannot include parent category or transfer_account",
+                )
+
+            split_rows = []
+            split_total = 0
+            for split in item.splits:
+                cat_uuid = store.resolve_uuid(split.category)
+                if cat_uuid not in month_cats:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Split category {split.category} not found",
+                    )
+                split_amount = str_to_milli(split.amount)
+                split_total += split_amount
+                split_rows.append({
+                    "category": split.category,
+                    "category_uuid": cat_uuid,
+                    "amount": milli_to_str(split_amount),
+                    "amount_milli": split_amount,
+                    "memo": split.memo,
+                })
+
+            parent_amount = int(tx.get("amount", 0))
+            if split_total != parent_amount:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"{item.ref}: split lines total {milli_to_str(split_total)} "
+                        f"but transaction amount is {milli_to_str(parent_amount)}"
+                    ),
+                )
+
+            verified.append({
+                "ref": item.ref,
+                "operation": operation,
+                "real_tx_id": tx_uuid,
+                "payee": tx_display_payee(tx),
+                "amount": milli_to_str(parent_amount),
+                "current_category": category_alias(old_cat_id) or "Uncategorized",
+                "target_category": "Split",
+                "target_category_uuid": None,
+                "new_memo": item.memo if item.memo is not None else tx.get("memo"),
+                "approve": item.approve,
+                "transfer_account": None,
+                "transfer_account_uuid": None,
+                "transfer_payee_id": None,
+                "splits": split_rows,
+                "warnings": warnings,
+                "expected": {
+                    "date": tx.get("date"),
+                    "amount": parent_amount,
+                    "category_id": old_cat_id,
+                    "memo": tx.get("memo"),
+                    "approved": bool(tx.get("approved")),
+                    "payee_id": tx.get("payee_id"),
+                    "is_split": False,
+                },
+            })
+            continue
+
+        if operation == "transfer":
+            if not item.transfer_account:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{item.ref}: transfer operation requires transfer_account",
+                )
+            if item.category is not None or item.splits is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{item.ref}: transfer operation cannot include category or splits",
+                )
+            if tx.get("subtransactions"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{item.ref} is a split transaction and cannot be converted to a transfer",
+                )
+
+            target_account_uuid = store.resolve_uuid(item.transfer_account)
+            target_account = store.accounts.get(target_account_uuid)
+            if not target_account or target_account.get("closed"):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Transfer account {item.transfer_account} not found or closed",
+                )
+            if target_account_uuid == tx.get("account_id"):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{item.ref}: transfer target cannot be the same account",
+                )
+
+            transfer_payee_id = transfer_payee_id_for_account(target_account_uuid)
+            if not transfer_payee_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"No YNAB transfer payee found for {item.transfer_account}; "
+                        "sync the account/payee data and re-propose"
+                    ),
+                )
+
+            verified.append({
+                "ref": item.ref,
+                "operation": operation,
+                "real_tx_id": tx_uuid,
+                "payee": tx_display_payee(tx),
+                "amount": milli_to_str(int(tx.get("amount", 0))),
+                "current_category": category_alias(old_cat_id) or "Uncategorized",
+                "target_category": "Transfer",
+                "target_category_uuid": None,
+                "new_memo": item.memo if item.memo is not None else tx.get("memo"),
+                "approve": item.approve,
+                "transfer_account": item.transfer_account,
+                "transfer_account_uuid": target_account_uuid,
+                "transfer_payee_id": transfer_payee_id,
+                "splits": None,
+                "warnings": warnings,
+                "expected": {
+                    "date": tx.get("date"),
+                    "amount": int(tx.get("amount", 0)),
+                    "category_id": old_cat_id,
+                    "memo": tx.get("memo"),
+                    "approved": bool(tx.get("approved")),
+                    "payee_id": tx.get("payee_id"),
+                    "is_split": bool(tx.get("subtransactions")),
+                },
+            })
+            continue
+
+        raise HTTPException(status_code=422, detail=f"Unsupported operation {operation}")
 
     proposal = {
         "proposal_id": proposal_id,
@@ -1367,12 +1891,26 @@ async def propose_transaction_changes(payload: TransactionProposalPayload):
         "summary": [
             {
                 "ref": c["ref"],
+                "operation": c["operation"],
                 "payee": c["payee"],
                 "amount": c["amount"],
                 "current_category": c["current_category"],
                 "target_category": c["target_category"],
                 "proposed_memo": c["new_memo"],
                 "approve": c["approve"],
+                "transfer_account": c["transfer_account"],
+                "splits": (
+                    [
+                        {
+                            "category": s["category"],
+                            "amount": s["amount"],
+                            "memo": s["memo"] or "",
+                        }
+                        for s in c["splits"]
+                    ]
+                    if c["splits"] else None
+                ),
+                "warnings": c["warnings"],
             }
             for c in verified
         ],
@@ -1522,12 +2060,26 @@ async def get_proposal(proposal_id: str):
         summary = [
             {
                 "ref": c["ref"],
+                "operation": c["operation"],
                 "payee": c["payee"],
                 "amount": c["amount"],
                 "current_category": c["current_category"],
                 "target_category": c["target_category"],
                 "proposed_memo": c["new_memo"],
                 "approve": c["approve"],
+                "transfer_account": c.get("transfer_account"),
+                "splits": (
+                    [
+                        {
+                            "category": s["category"],
+                            "amount": s["amount"],
+                            "memo": s["memo"] or "",
+                        }
+                        for s in (c.get("splits") or [])
+                    ]
+                    or None
+                ),
+                "warnings": c.get("warnings", []),
             }
             for c in proposal["changes"]
         ]
@@ -1577,7 +2129,7 @@ async def commit_proposal(proposal_id: str):
     headers = {"Authorization": f"Bearer {YNAB_API_TOKEN}"}
 
     if proposal["kind"] == "transactions":
-        patches = []
+        # Optimistic concurrency validation before any writes.
         for item in proposal["changes"]:
             tx = store.transactions.get(item["real_tx_id"])
             if not tx:
@@ -1590,6 +2142,8 @@ async def commit_proposal(proposal_id: str):
                 "category_id": tx.get("category_id"),
                 "memo": tx.get("memo"),
                 "approved": bool(tx.get("approved")),
+                "payee_id": tx.get("payee_id"),
+                "is_split": bool(tx.get("subtransactions")),
             }
             if live != expected:
                 raise HTTPException(
@@ -1597,27 +2151,86 @@ async def commit_proposal(proposal_id: str):
                     detail=f"{item['ref']} changed after proposal creation; re-propose",
                 )
 
+        updates = []
+        deletes = []
+        for item in proposal["changes"]:
+            operation = item["operation"]
+
+            if operation == "delete":
+                deletes.append(item)
+                continue
+
             patch = {
                 "id": item["real_tx_id"],
                 "approved": item["approve"],
             }
-            if item["target_category_uuid"] != tx.get("category_id"):
-                patch["category_id"] = item["target_category_uuid"]
-            if item["new_memo"] != tx.get("memo"):
-                patch["memo"] = item["new_memo"]
-            patches.append(patch)
+
+            if operation == "update":
+                tx = store.transactions[item["real_tx_id"]]
+                if item["target_category_uuid"] != tx.get("category_id"):
+                    patch["category_id"] = item["target_category_uuid"]
+                if item["new_memo"] != tx.get("memo"):
+                    patch["memo"] = item["new_memo"]
+
+            elif operation == "split":
+                patch["category_id"] = None
+                patch["subtransactions"] = [
+                    {
+                        "amount": s["amount_milli"],
+                        "category_id": s["category_uuid"],
+                        "memo": s["memo"],
+                    }
+                    for s in item["splits"]
+                ]
+                tx = store.transactions[item["real_tx_id"]]
+                if item["new_memo"] != tx.get("memo"):
+                    patch["memo"] = item["new_memo"]
+
+            elif operation == "transfer":
+                patch["payee_id"] = item["transfer_payee_id"]
+                patch["category_id"] = None
+                tx = store.transactions[item["real_tx_id"]]
+                if item["new_memo"] != tx.get("memo"):
+                    patch["memo"] = item["new_memo"]
+
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Unknown transaction operation {operation}",
+                )
+
+            updates.append(patch)
 
         async with httpx.AsyncClient(base_url=YNAB_BASE_URL, timeout=20.0) as client:
-            resp = await client.patch(
-                f"/budgets/{YNAB_BUDGET_ID}/transactions",
-                headers=headers,
-                json={"transactions": patches},
-            )
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"YNAB transaction batch update failed: {resp.status_code}",
+            if updates:
+                resp = await client.patch(
+                    f"/budgets/{YNAB_BUDGET_ID}/transactions",
+                    headers=headers,
+                    json={"transactions": updates},
                 )
+                if resp.status_code != 200:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"YNAB transaction batch update failed: {resp.status_code}",
+                    )
+
+            # DELETE is only available as a single-transaction endpoint.
+            # If a later delete fails after an earlier update/delete succeeds,
+            # mark the proposal partial_failure so it cannot be blindly replayed.
+            for item in deletes:
+                resp = await client.delete(
+                    f"/budgets/{YNAB_BUDGET_ID}/transactions/{item['real_tx_id']}",
+                    headers=headers,
+                )
+                if resp.status_code != 200:
+                    proposal["status"] = "partial_failure"
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            f"Delete failed for {item['ref']}; re-sync and re-propose "
+                            "before retrying"
+                        ),
+                    )
 
     elif proposal["kind"] == "assignments":
         month_cats = current_month_categories()

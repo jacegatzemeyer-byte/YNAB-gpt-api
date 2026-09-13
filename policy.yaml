@@ -1,137 +1,181 @@
-policy_version: 2.0
+policy_version: 3.0
 
+# ---------------------------------------------------------------------
+# Cash protection
+# ---------------------------------------------------------------------
 cash:
-  primary_checking_alias: "acct:wf_checking_1688"
+  primary_checking_alias: acct:wf_checking_1688
   minimum_floor: 1000.00
 
-# These classes are decision-oriented, not just mirrors of YNAB category groups.
-# "essential" is intentionally singular because the middleware's safety warning
-# recognizes that exact class name.
+# Backward-compatible value used by the middleware if needed.
+checking_floor: "1000.00"
+
+# ---------------------------------------------------------------------
+# Household category classes
+# ---------------------------------------------------------------------
 category_classes:
   essential:
-    - "cat:00_rocket_mortgage_fund_prior_month"
-    - "cat:03_black_hills_energy"
-    - "cat:15_oppd"
-    - "cat:21_cox_internet"
-    - "cat:22_usaa_insurance"
-    - "cat:childcare_tuition"
-    - "cat:groceries"
-    - "cat:01_waste_connections_quarterly"
-    - "cat:auto_maintenance"
-    - "cat:auto_registration_taxes"
-    - "cat:home_repairs_appliances"
-    - "cat:medical_reserve_deductible"
-    - "cat:medical_dental_vision"
-    - "cat:medical_routine_prescriptions"
-    - "cat:medical_therapy"
-    - "cat:periodic_home_pest_control"
-    - "cat:fuel"
-    - "cat:household_supplies"
-    - "cat:parking_tolls_transit"
-    - "cat:personal_care_products"
-    - "cat:pet_care"
-    - "cat:school_fees_supplies"
+    - cat:00_rocket_mortgage_fund_prior_month
+    - cat:03_black_hills_energy
+    - cat:15_oppd
+    - cat:21_cox_internet
+    - cat:22_usaa_insurance
+    - cat:childcare_tuition
+    - cat:groceries
+    - cat:01_waste_connections_quarterly
+    - cat:auto_maintenance
+    - cat:auto_registration_taxes
+    - cat:home_repairs_appliances
+    - cat:medical_reserve_deductible
+    - cat:medical_dental_vision
+    - cat:medical_routine_prescriptions
+    - cat:medical_therapy
+    - cat:periodic_home_pest_control
+    - cat:fuel
+    - cat:household_supplies
+    - cat:parking_tolls_transit
+    - cat:personal_care_products
+    - cat:pet_care
+    - cat:school_fees_supplies
 
   debt:
-    - "cat:credit_card_interest"
-    - "cat:medical_payment_plan"
-    - "cat:sofi_personal_loan_payment"
-    - "cat:09_wells_fargo_auto_loan"
+    - cat:credit_card_interest
+    - cat:medical_payment_plan
+    - cat:sofi_personal_loan_payment
+    - cat:09_wells_fargo_auto_loan
 
   credit_card_payment:
-    - "cat:bank_of_america_credit_card_7333"
-    - "cat:chase_freedom_credit_card_2934"
-    - "cat:chase_southwest_credit_card_5766"
-    - "cat:citi_credit_card_4482"
-    - "cat:wf_reflect_credit_card_3349"
+    - cat:bank_of_america_credit_card_7333
+    - cat:chase_freedom_credit_card_2934
+    - cat:chase_southwest_credit_card_5766
+    - cat:citi_credit_card_4482
+    - cat:wf_reflect_credit_card_3349
 
   flexible_essential:
-    - "cat:clothing"
-    - "cat:home_services_cleaning_lawn"
-    - "cat:kids_activities_coaching"
-    - "cat:personal_care_services"
+    - cat:clothing
+    - cat:home_services_cleaning_lawn
+    - cat:kids_activities_coaching
+    - cat:personal_care_services
 
   true_expense:
-    - "cat:0202_ynab_annual"
-    - "cat:0901_ring_annual"
-    - "cat:banking_fees"
+    - cat:0202_ynab_annual
+    - cat:0901_ring_annual
+    - cat:banking_fees
 
   discretionary:
-    - "cat:06_google_one"
-    - "cat:12_disney"
-    - "cat:12_naxos"
-    - "cat:18_netflix"
-    - "cat:annual_subscription_amazon_prime"
-    - "cat:gifts_celebrations"
-    - "cat:vacation_travel"
-    - "cat:books_music_media"
-    - "cat:cash_pocket_money"
-    - "cat:coffee"
-    - "cat:dining_out"
-    - "cat:donations"
-    - "cat:family_fun_hobbies"
-    - "cat:stuff_i_forgot_to_plan_for"
+    - cat:06_google_one
+    - cat:12_disney
+    - cat:12_naxos
+    - cat:18_netflix
+    - cat:annual_subscription_amazon_prime
+    - cat:gifts_celebrations
+    - cat:vacation_travel
+    - cat:books_music_media
+    - cat:cash_pocket_money
+    - cat:coffee
+    - cat:dining_out
+    - cat:donations
+    - cat:family_fun_hobbies
+    - cat:stuff_i_forgot_to_plan_for
 
   business:
-    - "cat:business_funding_owner_contribution"
+    - cat:business_funding_owner_contribution
 
   review:
-    - "cat:unexpected_needs_review"
+    - cat:unexpected_needs_review
 
   legacy:
-    - "cat:legacy_home_utilities_historical"
-    - "cat:legacy_media_subscriptions_historical"
+    - cat:legacy_home_utilities_historical
+    - cat:legacy_media_subscriptions_historical
 
   internal:
-    - "cat:inflow_ready_to_assign"
-    - "cat:uncategorized"
+    - cat:inflow_ready_to_assign
+    - cat:uncategorized
+
+# ---------------------------------------------------------------------
+# Reallocation planner
+#
+# main_v3.py reads these two top-level keys directly.
+# Earlier policy semantics are also retained below in reallocation_policy.
+# ---------------------------------------------------------------------
+reallocation_priority:
+  - discretionary
+  - flexible_essential
+  - true_expense
+  - savings
+  - unclassified
+
+protected_reallocation_classes:
+  - essential
+  - debt
+  - credit_card_payment
+  - business
+  - review
+  - legacy
+  - internal
 
 reallocation_policy:
-  # When money must be moved, search these classes in this order.
   source_priority:
-    - "discretionary"
-    - "flexible_essential"
-    - "true_expense"
+    - discretionary
+    - flexible_essential
+    - true_expense
+    - savings
+    - unclassified
 
   protected_classes:
-    - "essential"
-    - "debt"
-    - "credit_card_payment"
-    - "business"
-    - "legacy"
-    - "internal"
+    - essential
+    - debt
+    - credit_card_payment
+    - business
+    - review
+    - legacy
+    - internal
 
   rules:
     - "Never recommend moving money out of a category with zero or negative Available."
     - "Protect the $1,000 checking floor across the cashflow forecast."
+    - "Use the credit-card-aware cashflow forecast when evaluating affordability."
     - "Fix current overspending before recommending new discretionary spending."
-    - "Do not move money out of essential, debt, credit-card-payment, business, legacy, or internal categories without explicit user approval."
+    - "Prefer discretionary categories as reallocation sources before flexible essentials or true expenses."
+    - "Do not move money out of essential, debt, credit-card-payment, business, review, legacy, or internal categories without explicit user approval."
     - "Do not automatically fund legacy or internal categories; investigate the underlying transaction or categorization first."
     - "Treat review categories as requiring inspection before either funding them or using them as a source."
+    - "Avoid drawing from a category that is underfunded against its YNAB goal when a healthier donor category is available."
+    - "All assignment changes must be staged with proposeAssignments and explicitly approved before commit."
 
+# ---------------------------------------------------------------------
+# Merchant categorization evidence
+# ---------------------------------------------------------------------
 merchant_rules:
-  "Midwest Pest Control": "cat:periodic_home_pest_control"
-  "Subway": "cat:dining_out"
-  "OPPD": "cat:15_oppd"
-  "Cox": "cat:21_cox_internet"
-  "Black Hills Energy": "cat:03_black_hills_energy"
-  "Waste Connections": "cat:01_waste_connections_quarterly"
-  "Netflix": "cat:18_netflix"
-  "Disney+": "cat:12_disney"
-  "Naxos": "cat:12_naxos"
-  "Spotify": "cat:books_music_media"
+  Midwest Pest Control: cat:periodic_home_pest_control
+  Subway: cat:dining_out
+  OPPD: cat:15_oppd
+  Cox: cat:21_cox_internet
+  Black Hills Energy: cat:03_black_hills_energy
+  Waste Connections: cat:01_waste_connections_quarterly
+  Netflix: cat:18_netflix
+  Disney+: cat:12_disney
+  Naxos: cat:12_naxos
+  Spotify: cat:books_music_media
 
 mixed_merchants:
-  - "Amazon"
-  - "Target"
-  - "Walmart"
+  - Amazon
+  - Target
+  - Walmart
   - "Sam's Club"
-  - "Costco"
+  - Costco
 
+# ---------------------------------------------------------------------
+# Transaction maintenance and guarded writes
+# ---------------------------------------------------------------------
 transaction_policy:
   rules:
     - "For mixed merchants, do not auto-categorize without receipt, order, memo, or merchant-history evidence."
     - "Do not categorize transfers as spending."
-    - "Do not replace the parent category of split transactions."
+    - "Do not replace the parent category of an existing split transaction."
     - "Prefer merchant history when a payee has a stable historical category."
-    - "Stage transaction changes first and require explicit confirmation before commit."
+    - "Treat duplicate detection as evidence, not proof; require explicit approval before deleting a possible duplicate."
+    - "Only convert a transaction to a transfer when the destination account is identified and the transfer evidence is strong."
+    - "Require split amounts to reconcile exactly to the parent transaction amount."
+    - "Stage update, delete, split, transfer, and category changes first; require explicit confirmation before commit."
+    - "Never commit a transaction proposal if the live transaction changed after the proposal was staged."
