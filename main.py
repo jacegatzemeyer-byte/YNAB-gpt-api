@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Literal, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 # =====================================================================
@@ -17,11 +18,9 @@ from pydantic import BaseModel, Field
 YNAB_API_TOKEN = os.getenv("YNAB_API_TOKEN", "").strip()
 YNAB_BUDGET_ID = os.getenv("YNAB_BUDGET_ID", "last-used").strip()
 
-MIDDLEWARE_API_KEY = (
-    os.getenv("MIDDLEWARE_API_KEY") 
-    or os.getenv("API_KEY") 
-    or "change-me-secret-key"
-).strip()
+# Normalize configured key: strip whitespace and wrapping quotation marks
+_raw_key = os.getenv("MIDDLEWARE_API_KEY") or os.getenv("API_KEY") or "change-me-secret-key"
+MIDDLEWARE_API_KEY = _raw_key.strip().strip('"').strip("'")
 
 PRIMARY_CHECKING_NAME = os.getenv("PRIMARY_CHECKING_NAME", "Checking").strip().lower()
 CHECKING_FLOOR = float(os.getenv("CHECKING_FLOOR", "1000.00"))
@@ -43,16 +42,41 @@ app.add_middleware(
 )
 
 
-def verify_auth(request: Request):
-    """Verifies that requests originate from your authenticated Custom GPT."""
-    incoming_key = request.headers.get("x-api-key") or request.headers.get("x_api_key")
+@app.middleware("http")
+async def authenticate_all_requests(request: Request, call_next):
+    """
+    Direct ASGI-level interceptor. Evaluates headers before endpoint dependencies
+    and normalizes formatting variations (case, Bearer prefixes, quotes).
+    """
+    # Allow public endpoints and schema docs
+    if request.url.path in ["/", "/docs", "/openapi.json", "/redoc"]:
+        return await call_next(request)
 
-    if not incoming_key or incoming_key.strip() != MIDDLEWARE_API_KEY:
-        print(f"AUTH FAILED: expected '{MIDDLEWARE_API_KEY}', received '{incoming_key}'")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing X-API-Key header",
+    # Search headers case-insensitively
+    raw_header = (
+        request.headers.get("x-api-key")
+        or request.headers.get("X-API-Key")
+        or request.headers.get("x_api_key")
+        or request.headers.get("authorization")
+    )
+
+    incoming_key = raw_header
+    if incoming_key:
+        incoming_key = incoming_key.strip().strip('"').strip("'")
+        if incoming_key.lower().startswith("bearer "):
+            incoming_key = incoming_key[7:].strip()
+
+    if not incoming_key or incoming_key != MIDDLEWARE_API_KEY:
+        print(
+            f"AUTH REJECTED -> Expected: '{MIDDLEWARE_API_KEY}' | Received: '{raw_header}' | Path: {request.url.path}",
+            flush=True,
         )
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Invalid or missing X-API-Key header"},
+        )
+
+    return await call_next(request)
 
 
 # =====================================================================
@@ -70,12 +94,10 @@ class BudgetStore:
         self.scheduled_transactions: List[dict] = []
         self.month_detail: Dict[str, Any] = {}
 
-        # Bidirectional alias maps
         self.alias_to_uuid: Dict[str, str] = {}
         self.uuid_to_alias: Dict[str, str] = {}
         self.ref_counter: int = 100
 
-        # Ephemeral write proposals {proposal_id: ProposalData}
         self.proposals: Dict[str, dict] = {}
 
     def _slugify(self, text: str) -> str:
@@ -107,7 +129,6 @@ class BudgetStore:
         return ref
 
     def resolve_uuid(self, identifier: str) -> str:
-        """Translates an alias (e.g., cat:groceries or t:101) back to a YNAB UUID."""
         return self.alias_to_uuid.get(identifier, identifier)
 
 
@@ -118,7 +139,6 @@ store = BudgetStore()
 # YNAB HTTP Client & Sync Engine
 # =====================================================================
 async def sync_ynab(force: bool = False):
-    """Synchronizes delta changes from YNAB into the normalized memory model."""
     if not YNAB_API_TOKEN:
         raise HTTPException(
             status_code=500,
@@ -158,20 +178,17 @@ async def sync_ynab(force: bool = False):
         store.server_knowledge = data.get("server_knowledge")
         store.last_sync_time = now
 
-        # 1. Accounts
         for acct in budget.get("accounts", []):
             if not acct.get("deleted", False):
                 store.accounts[acct["id"]] = acct
                 store.register_alias("acct", acct["name"], acct["id"])
 
-        # 2. Categories
         for group in budget.get("category_groups", []):
             for cat in group.get("categories", []):
                 if not cat.get("deleted", False) and not cat.get("hidden", False):
                     store.categories[cat["id"]] = cat
                     store.register_alias("cat", cat["name"], cat["id"])
 
-        # 3. Scheduled transactions
         if "scheduled_transactions" in budget:
             store.scheduled_transactions = [
                 tx
@@ -179,26 +196,22 @@ async def sync_ynab(force: bool = False):
                 if not tx.get("deleted", False)
             ]
 
-        # 4. Recent transactions (last 60 days)
         cutoff = (date.today() - timedelta(days=60)).isoformat()
         for tx in budget.get("transactions", []):
             if not tx.get("deleted", False) and tx.get("date", "") >= cutoff:
                 store.transactions[tx["id"]] = tx
                 store.get_transaction_ref(tx["id"])
 
-        # 5. Month state
         months = budget.get("months", [])
         if months:
             store.month_detail = months[0]
 
 
 def milli_to_str(milliunits: int) -> str:
-    """Safely converts YNAB milliunits integer to exact decimal currency string."""
     return f"{(milliunits / 1000.0):.2f}"
 
 
 def str_to_milli(amount_str: str) -> int:
-    """Converts a standard currency string into YNAB milliunits integer."""
     clean = amount_str.replace("$", "").replace(",", "").strip()
     return int(round(float(clean) * 1000))
 
@@ -206,9 +219,13 @@ def str_to_milli(amount_str: str) -> int:
 # =====================================================================
 # Intent-Shaped Endpoints
 # =====================================================================
+@app.get("/", summary="Health check")
+async def root():
+    return {"status": "online", "service": "YNAB Copilot Middleware"}
+
+
 @app.get("/ynab/current-context", summary="Household budget state in a single payload")
-async def get_current_context(request: Request):
-    verify_auth(request)
+async def get_current_context():
     await sync_ynab()
 
     rta_milli = store.month_detail.get("to_be_budgeted", 0)
@@ -267,11 +284,7 @@ async def get_current_context(request: Request):
     "/ynab/triage",
     summary="Pending and unapproved transactions formatted for categorization",
 )
-async def get_triage(
-    request: Request,
-    format: Literal["csv", "json"] = "csv",
-):
-    verify_auth(request)
+async def get_triage(format: Literal["csv", "json"] = "csv"):
     await sync_ynab()
 
     pending = []
@@ -315,11 +328,7 @@ async def get_triage(
     "/ynab/merchant/{name}/history",
     summary="Payee category distribution evidence for safe categorization",
 )
-async def get_merchant_history(
-    name: str,
-    request: Request,
-):
-    verify_auth(request)
+async def get_merchant_history(name: str):
     await sync_ynab()
 
     target = name.lower()
@@ -351,11 +360,7 @@ async def get_merchant_history(
     "/ynab/cashflow",
     summary="Deterministic cashflow forecast relative to checking floor",
 )
-async def get_cashflow(
-    request: Request,
-    days: int = Query(30, ge=7, le=90),
-):
-    verify_auth(request)
+async def get_cashflow(days: int = Query(30, ge=7, le=90)):
     await sync_ynab()
 
     today = date.today()
@@ -423,11 +428,7 @@ class AssignmentRequest(BaseModel):
     "/ynab/assignment",
     summary="Relative category budget modification preventing replacement bugs",
 )
-async def safe_assignment(
-    req: AssignmentRequest,
-    request: Request,
-):
-    verify_auth(request)
+async def safe_assignment(req: AssignmentRequest):
     await sync_ynab()
 
     cat_uuid = store.resolve_uuid(req.category)
@@ -490,11 +491,7 @@ class ProposalPayload(BaseModel):
     "/ynab/transactions/propose",
     summary="Create a preview proposal before applying writes",
 )
-async def propose_transaction_changes(
-    payload: ProposalPayload,
-    request: Request,
-):
-    verify_auth(request)
+async def propose_transaction_changes(payload: ProposalPayload):
     await sync_ynab()
 
     proposal_id = f"p:{str(uuid.uuid4())[:8]}"
@@ -549,12 +546,7 @@ async def propose_transaction_changes(
     "/ynab/transactions/commit/{proposal_id}",
     summary="Execute an approved write proposal",
 )
-async def commit_transaction_proposal(
-    proposal_id: str,
-    request: Request,
-):
-    verify_auth(request)
-
+async def commit_transaction_proposal(proposal_id: str):
     if proposal_id not in store.proposals:
         raise HTTPException(
             status_code=404, detail="Proposal not found or has expired"
@@ -593,8 +585,7 @@ async def commit_transaction_proposal(
 
 
 @app.get("/ynab/policy", summary="Get canonical household policy version")
-async def get_policy(request: Request):
-    verify_auth(request)
+async def get_policy():
     if os.path.exists("policy.yaml"):
         with open("policy.yaml", "r") as f:
             return yaml.safe_load(f)
