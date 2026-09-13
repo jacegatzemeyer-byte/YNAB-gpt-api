@@ -3,7 +3,7 @@ import re
 import time
 import uuid
 import yaml
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any, Dict, List, Literal, Optional
 
 import httpx
@@ -14,10 +14,17 @@ from pydantic import BaseModel, Field
 # =====================================================================
 # Configuration & Security
 # =====================================================================
-YNAB_API_TOKEN = os.getenv("YNAB_API_TOKEN", "")
-YNAB_BUDGET_ID = os.getenv("YNAB_BUDGET_ID", "default")
-MIDDLEWARE_API_KEY = os.getenv("MIDDLEWARE_API_KEY", "change-me-secret-key")
-PRIMARY_CHECKING_NAME = os.getenv("PRIMARY_CHECKING_NAME", "Checking").lower()
+YNAB_API_TOKEN = os.getenv("YNAB_API_TOKEN", "").strip()
+YNAB_BUDGET_ID = os.getenv("YNAB_BUDGET_ID", "last-used").strip()
+
+# Supports either variable name set in Railway dashboard
+MIDDLEWARE_API_KEY = (
+    os.getenv("MIDDLEWARE_API_KEY") 
+    or os.getenv("API_KEY") 
+    or "change-me-secret-key"
+).strip()
+
+PRIMARY_CHECKING_NAME = os.getenv("PRIMARY_CHECKING_NAME", "Checking").strip().lower()
 CHECKING_FLOOR = float(os.getenv("CHECKING_FLOOR", "1000.00"))
 
 YNAB_BASE_URL = "https://api.ynab.com/v1"
@@ -37,9 +44,9 @@ app.add_middleware(
 )
 
 
-def verify_auth(x_api_key: Optional[str] = Header(None)):
+def verify_auth(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
     """Verifies that requests originate from your authenticated Custom GPT."""
-    if not MIDDLEWARE_API_KEY or x_api_key != MIDDLEWARE_API_KEY:
+    if not x_api_key or x_api_key.strip() != MIDDLEWARE_API_KEY:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-API-Key header",
@@ -53,7 +60,7 @@ class BudgetStore:
     def __init__(self):
         self.server_knowledge: Optional[int] = None
         self.last_sync_time: float = 0.0
-        self.ttl_seconds: float = 45.0  # background freshness window
+        self.ttl_seconds: float = 45.0
 
         self.accounts: Dict[str, dict] = {}
         self.categories: Dict[str, dict] = {}
@@ -110,6 +117,12 @@ store = BudgetStore()
 # =====================================================================
 async def sync_ynab(force: bool = False):
     """Synchronizes delta changes from YNAB into the normalized memory model."""
+    if not YNAB_API_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="YNAB_API_TOKEN is not configured on Railway.",
+        )
+
     now = time.time()
     if (
         not force
@@ -138,9 +151,9 @@ async def sync_ynab(force: bool = False):
                 detail=f"YNAB sync failed: {resp.status_code} {resp.text}",
             )
 
-        data = resp.json()["data"]
-        budget = data["budget"]
-        store.server_knowledge = data["server_knowledge"]
+        data = resp.json().get("data", {})
+        budget = data.get("budget", {})
+        store.server_knowledge = data.get("server_knowledge")
         store.last_sync_time = now
 
         # 1. Accounts
@@ -191,10 +204,8 @@ def str_to_milli(amount_str: str) -> int:
 # =====================================================================
 # Intent-Shaped Endpoints
 # =====================================================================
-
-
 @app.get("/ynab/current-context", summary="Household budget state in a single payload")
-async def get_current_context(x_api_key: Optional[str] = Header(None)):
+async def get_current_context(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
     verify_auth(x_api_key)
     await sync_ynab()
 
@@ -259,7 +270,8 @@ async def get_current_context(x_api_key: Optional[str] = Header(None)):
     summary="Pending and unapproved transactions formatted for categorization",
 )
 async def get_triage(
-    format: Literal["csv", "json"] = "csv", x_api_key: Optional[str] = Header(None)
+    format: Literal["csv", "json"] = "csv",
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
     verify_auth(x_api_key)
     await sync_ynab()
@@ -293,7 +305,6 @@ async def get_triage(
     if format == "json":
         return {"count": len(pending), "transactions": pending}
 
-    # Default CSV formatting for model token efficiency
     lines = ["ref,date,account,payee,amount,approved,category,memo"]
     for row in pending:
         lines.append(
@@ -306,7 +317,9 @@ async def get_triage(
     "/ynab/merchant/{name}/history",
     summary="Payee category distribution evidence for safe categorization",
 )
-async def get_merchant_history(name: str, x_api_key: Optional[str] = Header(None)):
+async def get_merchant_history(
+    name: str, x_api_key: Optional[str] = Header(None, alias="X-API-Key")
+):
     verify_auth(x_api_key)
     await sync_ynab()
 
@@ -340,7 +353,8 @@ async def get_merchant_history(name: str, x_api_key: Optional[str] = Header(None
     summary="Deterministic cashflow forecast relative to checking floor",
 )
 async def get_cashflow(
-    days: int = Query(30, ge=7, le=90), x_api_key: Optional[str] = Header(None)
+    days: int = Query(30, ge=7, le=90),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
     verify_auth(x_api_key)
     await sync_ynab()
@@ -411,7 +425,8 @@ class AssignmentRequest(BaseModel):
     summary="Relative category budget modification preventing replacement bugs",
 )
 async def safe_assignment(
-    req: AssignmentRequest, x_api_key: Optional[str] = Header(None)
+    req: AssignmentRequest,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
     verify_auth(x_api_key)
     await sync_ynab()
@@ -430,7 +445,7 @@ async def safe_assignment(
         new_budgeted_milli = current_budgeted_milli + delta_milli
     elif req.operation == "subtract":
         new_budgeted_milli = current_budgeted_milli - delta_milli
-    else:  # 'set'
+    else:
         new_budgeted_milli = delta_milli
 
     current_month_iso = date.today().replace(day=1).isoformat()
@@ -449,7 +464,6 @@ async def safe_assignment(
                 detail=f"YNAB assignment update failed: {resp.text}",
             )
 
-    # Invalidate cache
     await sync_ynab(force=True)
 
     return {
@@ -478,7 +492,8 @@ class ProposalPayload(BaseModel):
     summary="Create a preview proposal before applying writes",
 )
 async def propose_transaction_changes(
-    payload: ProposalPayload, x_api_key: Optional[str] = Header(None)
+    payload: ProposalPayload,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
     verify_auth(x_api_key)
     await sync_ynab()
@@ -536,7 +551,8 @@ async def propose_transaction_changes(
     summary="Execute an approved write proposal",
 )
 async def commit_transaction_proposal(
-    proposal_id: str, x_api_key: Optional[str] = Header(None)
+    proposal_id: str,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
     verify_auth(x_api_key)
 
@@ -578,7 +594,7 @@ async def commit_transaction_proposal(
 
 
 @app.get("/ynab/policy", summary="Get canonical household policy version")
-async def get_policy(x_api_key: Optional[str] = Header(None)):
+async def get_policy(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
     verify_auth(x_api_key)
     if os.path.exists("policy.yaml"):
         with open("policy.yaml", "r") as f:
