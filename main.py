@@ -7,7 +7,7 @@ from datetime import date, timedelta
 from typing import Any, Dict, List, Literal, Optional
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -17,7 +17,6 @@ from pydantic import BaseModel, Field
 YNAB_API_TOKEN = os.getenv("YNAB_API_TOKEN", "").strip()
 YNAB_BUDGET_ID = os.getenv("YNAB_BUDGET_ID", "last-used").strip()
 
-# Supports either variable name set in Railway dashboard
 MIDDLEWARE_API_KEY = (
     os.getenv("MIDDLEWARE_API_KEY") 
     or os.getenv("API_KEY") 
@@ -44,9 +43,12 @@ app.add_middleware(
 )
 
 
-def verify_auth(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+def verify_auth(request: Request):
     """Verifies that requests originate from your authenticated Custom GPT."""
-    if not x_api_key or x_api_key.strip() != MIDDLEWARE_API_KEY:
+    incoming_key = request.headers.get("x-api-key") or request.headers.get("x_api_key")
+
+    if not incoming_key or incoming_key.strip() != MIDDLEWARE_API_KEY:
+        print(f"AUTH FAILED: expected '{MIDDLEWARE_API_KEY}', received '{incoming_key}'")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-API-Key header",
@@ -205,14 +207,12 @@ def str_to_milli(amount_str: str) -> int:
 # Intent-Shaped Endpoints
 # =====================================================================
 @app.get("/ynab/current-context", summary="Household budget state in a single payload")
-async def get_current_context(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
-    verify_auth(x_api_key)
+async def get_current_context(request: Request):
+    verify_auth(request)
     await sync_ynab()
 
-    # 1. Ready to assign
     rta_milli = store.month_detail.get("to_be_budgeted", 0)
 
-    # 2. Checking analysis
     checking_balance = 0.0
     for acct in store.accounts.values():
         if not acct.get("closed") and PRIMARY_CHECKING_NAME in acct["name"].lower():
@@ -220,7 +220,6 @@ async def get_current_context(x_api_key: Optional[str] = Header(None, alias="X-A
 
     above_floor = checking_balance - CHECKING_FLOOR
 
-    # 3. Overspent categories
     overspent = []
     for cat in store.categories.values():
         balance_milli = cat.get("balance", 0)
@@ -228,7 +227,6 @@ async def get_current_context(x_api_key: Optional[str] = Header(None, alias="X-A
             alias = store.uuid_to_alias.get(cat["id"], cat["name"])
             overspent.append([alias, milli_to_str(balance_milli)])
 
-    # 4. Upcoming 14 days obligations
     today = date.today()
     limit_14d = (today + timedelta(days=14)).isoformat()
     upcoming_14d = []
@@ -270,10 +268,10 @@ async def get_current_context(x_api_key: Optional[str] = Header(None, alias="X-A
     summary="Pending and unapproved transactions formatted for categorization",
 )
 async def get_triage(
+    request: Request,
     format: Literal["csv", "json"] = "csv",
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
-    verify_auth(x_api_key)
+    verify_auth(request)
     await sync_ynab()
 
     pending = []
@@ -318,9 +316,10 @@ async def get_triage(
     summary="Payee category distribution evidence for safe categorization",
 )
 async def get_merchant_history(
-    name: str, x_api_key: Optional[str] = Header(None, alias="X-API-Key")
+    name: str,
+    request: Request,
 ):
-    verify_auth(x_api_key)
+    verify_auth(request)
     await sync_ynab()
 
     target = name.lower()
@@ -353,10 +352,10 @@ async def get_merchant_history(
     summary="Deterministic cashflow forecast relative to checking floor",
 )
 async def get_cashflow(
+    request: Request,
     days: int = Query(30, ge=7, le=90),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
-    verify_auth(x_api_key)
+    verify_auth(request)
     await sync_ynab()
 
     today = date.today()
@@ -426,9 +425,9 @@ class AssignmentRequest(BaseModel):
 )
 async def safe_assignment(
     req: AssignmentRequest,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    request: Request,
 ):
-    verify_auth(x_api_key)
+    verify_auth(request)
     await sync_ynab()
 
     cat_uuid = store.resolve_uuid(req.category)
@@ -493,9 +492,9 @@ class ProposalPayload(BaseModel):
 )
 async def propose_transaction_changes(
     payload: ProposalPayload,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    request: Request,
 ):
-    verify_auth(x_api_key)
+    verify_auth(request)
     await sync_ynab()
 
     proposal_id = f"p:{str(uuid.uuid4())[:8]}"
@@ -552,9 +551,9 @@ async def propose_transaction_changes(
 )
 async def commit_transaction_proposal(
     proposal_id: str,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    request: Request,
 ):
-    verify_auth(x_api_key)
+    verify_auth(request)
 
     if proposal_id not in store.proposals:
         raise HTTPException(
@@ -594,8 +593,8 @@ async def commit_transaction_proposal(
 
 
 @app.get("/ynab/policy", summary="Get canonical household policy version")
-async def get_policy(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
-    verify_auth(x_api_key)
+async def get_policy(request: Request):
+    verify_auth(request)
     if os.path.exists("policy.yaml"):
         with open("policy.yaml", "r") as f:
             return yaml.safe_load(f)
