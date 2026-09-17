@@ -6,6 +6,7 @@ import os
 import re
 import time
 import uuid
+from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Literal, Optional
@@ -699,6 +700,106 @@ def scheduled_event_payload(stx_id: str, stx: dict, event_type: str) -> dict:
     }
 
 
+def add_months(d: date, months: int) -> date:
+    """Advance a date by whole calendar months without overflowing month-end."""
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(d.day, monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def next_scheduled_date(current: date, frequency: str) -> Optional[date]:
+    """Return the next occurrence for recurrence values emitted by YNAB.
+
+    Unknown recurrence values deliberately return None so the forecast can
+    report incomplete coverage instead of inventing dates.
+    """
+    normalized = normalize_text(frequency).replace(" ", "")
+
+    if normalized == "never":
+        return None
+    if normalized == "daily":
+        return current + timedelta(days=1)
+    if normalized == "weekly":
+        return current + timedelta(weeks=1)
+    if normalized in {"everyotherweek", "every2weeks"}:
+        return current + timedelta(weeks=2)
+    if normalized == "every4weeks":
+        return current + timedelta(weeks=4)
+    if normalized == "monthly":
+        return add_months(current, 1)
+    if normalized in {"everyothermonth", "every2months"}:
+        return add_months(current, 2)
+    if normalized == "every3months":
+        return add_months(current, 3)
+    if normalized == "every4months":
+        return add_months(current, 4)
+    if normalized in {"twiceayear", "every6months"}:
+        return add_months(current, 6)
+    if normalized == "yearly":
+        return add_months(current, 12)
+    if normalized == "everyotheryear":
+        return add_months(current, 24)
+
+    # twiceAMonth and any future/unknown YNAB frequency require explicit
+    # semantics before they should be synthesized.
+    return None
+
+
+def expand_scheduled_transaction(
+    stx_id: str,
+    stx: dict,
+    start_date: date,
+    end_date: date,
+    event_type: str,
+) -> tuple[List[dict], Optional[str]]:
+    """Expand one scheduled transaction through the requested forecast window.
+
+    Returns (events, coverage_issue). A coverage issue is surfaced rather than
+    silently guessing when recurrence data is missing or unsupported.
+    """
+    raw_next = stx.get("date_next")
+    if not raw_next:
+        return [], "missing_date_next"
+
+    try:
+        occurrence = date.fromisoformat(raw_next)
+    except (TypeError, ValueError):
+        return [], "invalid_date_next"
+
+    frequency = str(stx.get("frequency") or "never")
+    normalized_frequency = normalize_text(frequency).replace(" ", "")
+    events: List[dict] = []
+    max_occurrences = 500
+
+    for occurrence_index in range(max_occurrences):
+        if occurrence > end_date:
+            break
+
+        if occurrence >= start_date:
+            event = scheduled_event_payload(stx_id, stx, event_type)
+            event["date"] = occurrence.isoformat()
+            event["occurrence_index"] = occurrence_index
+            events.append(event)
+
+        next_date = next_scheduled_date(occurrence, frequency)
+
+        if next_date is None:
+            if normalized_frequency == "never":
+                break
+            return events, f"unsupported_frequency:{frequency}"
+
+        if next_date <= occurrence:
+            return events, f"non_advancing_frequency:{frequency}"
+
+        occurrence = next_date
+    else:
+        return events, "occurrence_limit_exceeded"
+
+    return events, None
+
+
 def build_reallocation_plan(
     target_category: str,
     amount_milli: Optional[int] = None,
@@ -1311,30 +1412,35 @@ async def get_cashflow(days: int = Query(30, ge=7, le=90)):
 
     checking_events = []
     card_events = []
-    unexpanded_recurring = []
+    coverage_issues = []
 
     for stx_id, stx in store.scheduled_transactions.items():
-        d_str = stx.get("date_next")
-        if not d_str:
-            continue
-        next_date = date.fromisoformat(d_str)
-        if not (today <= next_date <= end_date):
-            continue
-
         account_id = stx.get("account_id")
+
         if account_id in checking_ids:
-            event = scheduled_event_payload(stx_id, stx, "checking")
-            checking_events.append(event)
+            event_type = "checking"
+            destination = checking_events
         elif account_id in card_ids:
-            event = scheduled_event_payload(stx_id, stx, "credit_card")
-            card_events.append(event)
+            event_type = "credit_card"
+            destination = card_events
         else:
             continue
 
-        if (stx.get("frequency") or "never") != "never":
-            # Recurring rows are not synthesized beyond date_next. Surface
-            # coverage limits rather than creating false precision.
-            unexpanded_recurring.append(store.scheduled_ref(stx_id))
+        events, issue = expand_scheduled_transaction(
+            stx_id=stx_id,
+            stx=stx,
+            start_date=today,
+            end_date=end_date,
+            event_type=event_type,
+        )
+        destination.extend(events)
+
+        if issue:
+            coverage_issues.append({
+                "ref": store.scheduled_ref(stx_id),
+                "frequency": stx.get("frequency") or "never",
+                "issue": issue,
+            })
 
     checking_events.sort(key=lambda x: (x["date"], x["ref"]))
     card_events.sort(key=lambda x: (x["date"], x["ref"]))
@@ -1407,7 +1513,7 @@ async def get_cashflow(days: int = Query(30, ge=7, le=90)):
     else:
         risk = "comfortable"
 
-    coverage_complete = len(unexpanded_recurring) == 0
+    coverage_complete = len(coverage_issues) == 0
     if not checking_events and not card_events:
         risk = "insufficient_data"
     elif not coverage_complete and risk != "breached":
@@ -1442,7 +1548,15 @@ async def get_cashflow(days: int = Query(30, ge=7, le=90)):
         "scheduled_checking_event_count": len(checking_events),
         "scheduled_card_event_count": len(card_events),
         "scheduled_event_count": len(checking_events) + len(card_events),
-        "unexpanded_recurring_refs": sorted(set(unexpanded_recurring)),
+        "coverage": {
+            "scheduled_recurrence_expansion_complete": coverage_complete,
+            "issues": coverage_issues,
+        },
+        # Deprecated compatibility field. Unsupported recurrence refs remain
+        # visible here for existing clients while the richer coverage object is adopted.
+        "unexpanded_recurring_refs": sorted({
+            issue["ref"] for issue in coverage_issues
+        }),
         "events": rendered_checking,
         "credit_card_events": rendered_card,
     }
