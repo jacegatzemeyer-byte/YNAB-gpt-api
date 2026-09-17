@@ -81,7 +81,7 @@ YNAB_BASE_URL = "https://api.ynab.com/v1"
 app = FastAPI(
     title="YNAB Copilot Middleware",
     description="Deterministic read-model, Plaid-backed read-only reconciliation, and guarded write layer between ChatGPT and YNAB",
-    version="3.3.1",
+    version="3.3.2",
 )
 
 
@@ -1506,11 +1506,44 @@ async def sync_plaid_transactions():
 
     store.plaid_cursor = cursor
 
+    mapped_account_ids = set(PLAID_YNAB_ACCOUNT_MAP.keys())
+    mapped_transactions = []
+    skipped_unmapped_account_ids = set()
+    skipped_unmapped_transaction_count = 0
+
+    for tx in store.plaid_transactions.values():
+        plaid_account_id = str(tx.get("account_id") or "")
+        if plaid_account_id not in mapped_account_ids:
+            if plaid_account_id:
+                skipped_unmapped_account_ids.add(plaid_account_id)
+            skipped_unmapped_transaction_count += 1
+            continue
+        mapped_transactions.append(tx)
+
     external_transactions = [
         plaid_to_external_transaction(tx)
-        for tx in store.plaid_transactions.values()
+        for tx in mapped_transactions
     ]
-    report = reconcile_external_transactions("plaid", external_transactions)
+
+    if not external_transactions:
+        report = {
+            "source": "plaid",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "read_only": True,
+            "external_transaction_count": 0,
+            "counts": {"ynab_only": 0},
+            "accounts": [],
+            "transactions": [],
+            "ynab_only": [],
+            "notes": [
+                "No mapped Plaid transactions were available for reconciliation.",
+                "Unmapped Plaid accounts were skipped and did not cause sync failure.",
+                "No reconciliation result mutates YNAB.",
+            ],
+        }
+    else:
+        report = reconcile_external_transactions("plaid", external_transactions)
+
     store.reconciliation_snapshot = report
 
     return {
@@ -1519,6 +1552,10 @@ async def sync_plaid_transactions():
             "modified": modified_count,
             "removed": removed_count,
             "cached_transaction_count": len(store.plaid_transactions),
+            "mapped_transaction_count": len(mapped_transactions),
+            "skipped_unmapped_transaction_count": skipped_unmapped_transaction_count,
+            "skipped_unmapped_account_ids": sorted(skipped_unmapped_account_ids),
+            "mapped_account_ids": sorted(mapped_account_ids),
             "cursor_present": bool(store.plaid_cursor),
         },
         "reconciliation": report,
