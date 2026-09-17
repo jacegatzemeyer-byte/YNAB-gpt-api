@@ -2,6 +2,7 @@ import csv
 import hashlib
 import hmac
 import io
+import json
 import os
 import re
 import time
@@ -47,12 +48,40 @@ HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "365"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "45"))
 PROPOSAL_TTL_SECONDS = int(os.getenv("PROPOSAL_TTL_SECONDS", "900"))
 
+# Plaid credentials are server-side only. PLAID_ACCESS_TOKEN is Item-specific
+# and is created after completing Plaid Link; it is not the Plaid client secret.
+PLAID_CLIENT_ID = (os.getenv("PLAID_CLIENT_ID") or "").strip()
+PLAID_SECRET = (os.getenv("PLAID_SECRET") or "").strip()
+PLAID_ENV = (os.getenv("PLAID_ENV") or "production").strip().lower()
+PLAID_ACCESS_TOKEN = (os.getenv("PLAID_ACCESS_TOKEN") or "").strip()
+PLAID_ITEM_ID = (os.getenv("PLAID_ITEM_ID") or "").strip()
+PLAID_YNAB_ACCOUNT_MAP_RAW = (os.getenv("PLAID_YNAB_ACCOUNT_MAP") or "{}").strip()
+PLAID_DAYS_REQUESTED = int(os.getenv("PLAID_DAYS_REQUESTED", "365"))
+
+if PLAID_ENV not in {"sandbox", "production"}:
+    raise RuntimeError("PLAID_ENV must be 'sandbox' or 'production'")
+if not 1 <= PLAID_DAYS_REQUESTED <= 730:
+    raise RuntimeError("PLAID_DAYS_REQUESTED must be between 1 and 730")
+
+PLAID_BASE_URL = (
+    "https://sandbox.plaid.com"
+    if PLAID_ENV == "sandbox"
+    else "https://production.plaid.com"
+)
+
+try:
+    PLAID_YNAB_ACCOUNT_MAP = json.loads(PLAID_YNAB_ACCOUNT_MAP_RAW)
+except json.JSONDecodeError as exc:
+    raise RuntimeError("PLAID_YNAB_ACCOUNT_MAP must be valid JSON") from exc
+if not isinstance(PLAID_YNAB_ACCOUNT_MAP, dict):
+    raise RuntimeError("PLAID_YNAB_ACCOUNT_MAP must be a JSON object")
+
 YNAB_BASE_URL = "https://api.ynab.com/v1"
 
 app = FastAPI(
     title="YNAB Copilot Middleware",
-    description="Deterministic read-model, read-only external reconciliation, and guarded write layer between ChatGPT and YNAB",
-    version="3.2.0",
+    description="Deterministic read-model, Plaid-backed read-only reconciliation, and guarded write layer between ChatGPT and YNAB",
+    version="3.3.0",
 )
 
 
@@ -163,6 +192,13 @@ class BudgetStore:
         # Read-only external reconciliation snapshot. This is deliberately
         # ephemeral and never writes external data into YNAB.
         self.reconciliation_snapshot: Optional[Dict[str, Any]] = None
+
+        # Runtime Plaid state. Production credentials should be persisted as
+        # Railway secrets / a secret-capable datastore, not only in memory.
+        self.plaid_access_token: str = PLAID_ACCESS_TOKEN
+        self.plaid_item_id: str = PLAID_ITEM_ID
+        self.plaid_cursor: Optional[str] = None
+        self.plaid_transactions: Dict[str, dict] = {}
 
     def _slugify(self, text: str) -> str:
         s = re.sub(r"[^\w\s-]", "", text.strip().lower())
@@ -1134,6 +1170,324 @@ async def get_reconciliation_status():
             detail="No reconciliation snapshot is available; ingest external transactions first",
         )
     return store.reconciliation_snapshot
+
+
+# =====================================================================
+# Plaid Read-Only Ingestion
+# =====================================================================
+
+class PlaidHostedLinkRequest(BaseModel):
+    client_user_id: str = Field(
+        "household",
+        min_length=1,
+        max_length=128,
+        description="Stable non-sensitive identifier for this household",
+    )
+
+
+class PlaidLinkExchangeRequest(BaseModel):
+    link_token: str = Field(
+        ...,
+        min_length=1,
+        description="Hosted Link token returned by createPlaidHostedLink",
+    )
+    reveal_access_token: bool = Field(
+        False,
+        description=(
+            "If true, return the newly created Item access_token once so it can "
+            "be stored as a Railway secret. Do not expose this response publicly."
+        ),
+    )
+
+
+def require_plaid_credentials() -> None:
+    if not PLAID_CLIENT_ID or not PLAID_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="PLAID_CLIENT_ID and PLAID_SECRET must be configured in Railway",
+        )
+
+
+async def plaid_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    require_plaid_credentials()
+    body = {
+        "client_id": PLAID_CLIENT_ID,
+        "secret": PLAID_SECRET,
+        **payload,
+    }
+    async with httpx.AsyncClient(base_url=PLAID_BASE_URL, timeout=30.0) as client:
+        response = await client.post(path, json=body)
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+
+    if response.status_code >= 400:
+        error_code = data.get("error_code") or "PLAID_ERROR"
+        error_message = data.get("error_message") or f"HTTP {response.status_code}"
+        raise HTTPException(
+            status_code=502,
+            detail=f"Plaid {error_code}: {error_message}",
+        )
+    return data
+
+
+def plaid_amount_to_ynab_string(transaction: dict) -> str:
+    """Plaid positive transaction amounts are typically money leaving the account.
+
+    Convert into the middleware/YNAB convention: outflow negative, inflow positive.
+    """
+    amount = Decimal(str(transaction.get("amount", "0")))
+    normalized = -amount
+    return f"{normalized.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
+
+
+def plaid_account_alias(plaid_account_id: str) -> str:
+    alias = PLAID_YNAB_ACCOUNT_MAP.get(plaid_account_id)
+    if not alias:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Plaid account {plaid_account_id} has no YNAB mapping. "
+                "Add it to PLAID_YNAB_ACCOUNT_MAP in Railway."
+            ),
+        )
+    return str(alias)
+
+
+def plaid_to_external_transaction(transaction: dict) -> ExternalTransaction:
+    posted_date = transaction.get("date")
+    if not posted_date:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Plaid transaction {transaction.get('transaction_id')} has no posted date",
+        )
+
+    return ExternalTransaction(
+        external_id=str(transaction["transaction_id"]),
+        account=plaid_account_alias(str(transaction["account_id"])),
+        posted_date=date.fromisoformat(posted_date),
+        authorized_date=(
+            date.fromisoformat(transaction["authorized_date"])
+            if transaction.get("authorized_date") else None
+        ),
+        amount=plaid_amount_to_ynab_string(transaction),
+        merchant=transaction.get("merchant_name"),
+        description=transaction.get("name"),
+        pending=bool(transaction.get("pending", False)),
+    )
+
+
+@app.post(
+    "/plaid/link/hosted",
+    summary="Create a Plaid Hosted Link session",
+    operation_id="createPlaidHostedLink",
+)
+async def create_plaid_hosted_link(payload: PlaidHostedLinkRequest):
+    """Create a Plaid-hosted bank-linking URL; no custom frontend is required."""
+    data = await plaid_post(
+        "/link/token/create",
+        {
+            "user": {"client_user_id": payload.client_user_id},
+            "client_name": "YNAB Budget Copilot",
+            "products": ["transactions"],
+            "country_codes": ["US"],
+            "language": "en",
+            "transactions": {"days_requested": PLAID_DAYS_REQUESTED},
+            "hosted_link": {},
+        },
+    )
+    return {
+        "link_token": data.get("link_token"),
+        "hosted_link_url": data.get("hosted_link_url"),
+        "expiration": data.get("expiration"),
+        "environment": PLAID_ENV,
+    }
+
+
+@app.post(
+    "/plaid/link/exchange",
+    summary="Exchange a completed Hosted Link session for a Plaid Item",
+    operation_id="exchangePlaidHostedLink",
+)
+async def exchange_plaid_hosted_link(payload: PlaidLinkExchangeRequest):
+    """Resolve a completed Hosted Link session and exchange its public token.
+
+    The access token is retained in runtime memory for immediate testing. For
+    durable production use, save it as PLAID_ACCESS_TOKEN in Railway (or a
+    secret-capable database). It is returned only when reveal_access_token=true.
+    """
+    session = await plaid_post(
+        "/link/token/get",
+        {"link_token": payload.link_token},
+    )
+
+    results = session.get("results") or {}
+    public_tokens = results.get("public_tokens") or []
+
+    # Backward-compatible fallback for Plaid responses that expose on_success.
+    if not public_tokens:
+        on_success = session.get("on_success") or {}
+        public_token = on_success.get("public_token")
+        if public_token:
+            public_tokens = [public_token]
+
+    if not public_tokens:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Hosted Link has not produced a public_token yet. Complete the "
+                "hosted_link_url first, then retry this endpoint."
+            ),
+        )
+    if len(public_tokens) != 1:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This middleware currently expects one Plaid Item per Hosted Link "
+                "session. Create separate sessions for additional institutions."
+            ),
+        )
+
+    exchanged = await plaid_post(
+        "/item/public_token/exchange",
+        {"public_token": public_tokens[0]},
+    )
+    access_token = exchanged.get("access_token") or ""
+    item_id = exchanged.get("item_id") or ""
+    if not access_token or not item_id:
+        raise HTTPException(status_code=502, detail="Plaid token exchange returned incomplete data")
+
+    store.plaid_access_token = access_token
+    store.plaid_item_id = item_id
+    store.plaid_cursor = None
+    store.plaid_transactions = {}
+
+    response = {
+        "connected": True,
+        "item_id": item_id,
+        "access_token_configured_in_runtime": True,
+        "next_step": (
+            "Persist the Item access token securely as PLAID_ACCESS_TOKEN in Railway, "
+            "then configure PLAID_YNAB_ACCOUNT_MAP."
+        ),
+    }
+    if payload.reveal_access_token:
+        response["access_token"] = access_token
+        response["security_warning"] = (
+            "Treat access_token as a password. Store it in Railway Variables and do not "
+            "put it in source code, CustomGPT instructions, or chat history."
+        )
+    return response
+
+
+@app.get(
+    "/plaid/accounts",
+    summary="List Plaid accounts for YNAB account mapping",
+    operation_id="getPlaidAccounts",
+)
+async def get_plaid_accounts():
+    access_token = store.plaid_access_token or PLAID_ACCESS_TOKEN
+    if not access_token:
+        raise HTTPException(
+            status_code=409,
+            detail="No Plaid Item access token is configured",
+        )
+    data = await plaid_post("/accounts/get", {"access_token": access_token})
+    accounts = []
+    for account in data.get("accounts", []):
+        plaid_id = str(account.get("account_id") or "")
+        accounts.append({
+            "plaid_account_id": plaid_id,
+            "name": account.get("name"),
+            "official_name": account.get("official_name"),
+            "type": account.get("type"),
+            "subtype": account.get("subtype"),
+            "mask": account.get("mask"),
+            "ynab_account": PLAID_YNAB_ACCOUNT_MAP.get(plaid_id, ""),
+            "mapped": plaid_id in PLAID_YNAB_ACCOUNT_MAP,
+        })
+    return {
+        "item_id": store.plaid_item_id or PLAID_ITEM_ID,
+        "accounts": accounts,
+    }
+
+
+@app.post(
+    "/plaid/sync",
+    summary="Sync Plaid Transactions and run read-only YNAB reconciliation",
+    operation_id="syncPlaidTransactions",
+)
+async def sync_plaid_transactions():
+    await sync_ynab()
+    access_token = store.plaid_access_token or PLAID_ACCESS_TOKEN
+    if not access_token:
+        raise HTTPException(
+            status_code=409,
+            detail="No Plaid access token configured; complete Plaid Link first",
+        )
+
+    cursor = store.plaid_cursor
+    added_count = modified_count = removed_count = 0
+
+    # Plaid requires repeating /transactions/sync while has_more is true.
+    # MODIFIED/REMOVED updates are applied to a local read-only cache before
+    # reconciliation so the current external snapshot is internally consistent.
+    for _ in range(100):
+        request_body: Dict[str, Any] = {
+            "access_token": access_token,
+            "count": 500,
+        }
+        if cursor:
+            request_body["cursor"] = cursor
+
+        page = await plaid_post("/transactions/sync", request_body)
+
+        for tx in page.get("added", []):
+            tx_id = str(tx["transaction_id"])
+            store.plaid_transactions[tx_id] = tx
+            added_count += 1
+
+        for tx in page.get("modified", []):
+            tx_id = str(tx["transaction_id"])
+            store.plaid_transactions[tx_id] = tx
+            modified_count += 1
+
+        for removed in page.get("removed", []):
+            tx_id = str(removed.get("transaction_id") or "")
+            if tx_id:
+                store.plaid_transactions.pop(tx_id, None)
+                removed_count += 1
+
+        cursor = page.get("next_cursor") or cursor
+        if not page.get("has_more", False):
+            break
+    else:
+        raise HTTPException(
+            status_code=502,
+            detail="Plaid transaction sync exceeded 100 pages",
+        )
+
+    store.plaid_cursor = cursor
+
+    external_transactions = [
+        plaid_to_external_transaction(tx)
+        for tx in store.plaid_transactions.values()
+    ]
+    report = reconcile_external_transactions("plaid", external_transactions)
+    store.reconciliation_snapshot = report
+
+    return {
+        "plaid_sync": {
+            "added": added_count,
+            "modified": modified_count,
+            "removed": removed_count,
+            "cached_transaction_count": len(store.plaid_transactions),
+            "cursor_present": bool(store.plaid_cursor),
+        },
+        "reconciliation": report,
+    }
 
 
 # =====================================================================
