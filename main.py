@@ -81,7 +81,7 @@ YNAB_BASE_URL = "https://api.ynab.com/v1"
 app = FastAPI(
     title="YNAB Copilot Middleware",
     description="Deterministic read-model, Plaid-backed read-only reconciliation, and guarded write layer between ChatGPT and YNAB",
-    version="3.3.0",
+    version="3.3.1",
 )
 
 
@@ -1323,22 +1323,57 @@ async def exchange_plaid_hosted_link(payload: PlaidLinkExchangeRequest):
         {"link_token": payload.link_token},
     )
 
+    # Current Plaid Hosted Link responses expose Item-add results per Link
+    # session at link_sessions[].results.item_add_results[].public_token.
+    # Retain legacy fallbacks for compatibility with older response shapes.
+    public_tokens: List[str] = []
+
+    def add_public_token(value: Any) -> None:
+        if isinstance(value, str) and value and value not in public_tokens:
+            public_tokens.append(value)
+
+    link_sessions = session.get("link_sessions") or []
+    if isinstance(link_sessions, list):
+        for link_session in link_sessions:
+            if not isinstance(link_session, dict):
+                continue
+            results = link_session.get("results") or {}
+            if not isinstance(results, dict):
+                continue
+            item_add_results = results.get("item_add_results") or []
+            if isinstance(item_add_results, list):
+                for item_result in item_add_results:
+                    if isinstance(item_result, dict):
+                        add_public_token(item_result.get("public_token"))
+
+    # Compatibility: accept top-level results shapes as well.
     results = session.get("results") or {}
-    public_tokens = results.get("public_tokens") or []
+    if isinstance(results, dict):
+        item_add_results = results.get("item_add_results") or []
+        if isinstance(item_add_results, list):
+            for item_result in item_add_results:
+                if isinstance(item_result, dict):
+                    add_public_token(item_result.get("public_token"))
 
-    # Backward-compatible fallback for Plaid responses that expose on_success.
-    if not public_tokens:
-        on_success = session.get("on_success") or {}
-        public_token = on_success.get("public_token")
-        if public_token:
-            public_tokens = [public_token]
+        legacy_tokens = results.get("public_tokens") or []
+        if isinstance(legacy_tokens, list):
+            for token in legacy_tokens:
+                add_public_token(token)
+
+    on_success = session.get("on_success") or {}
+    if isinstance(on_success, dict):
+        add_public_token(on_success.get("public_token"))
 
     if not public_tokens:
+        session_count = len(link_sessions) if isinstance(link_sessions, list) else 0
         raise HTTPException(
             status_code=409,
             detail=(
-                "Hosted Link has not produced a public_token yet. Complete the "
-                "hosted_link_url first, then retry this endpoint."
+                "Hosted Link completed but no Item public_token was found in the "
+                "Plaid /link/token/get response. Checked "
+                "link_sessions[].results.item_add_results[], top-level "
+                "results.item_add_results[], legacy results.public_tokens, and "
+                f"on_success.public_token. link_session_count={session_count}"
             ),
         )
     if len(public_tokens) != 1:
