@@ -51,8 +51,8 @@ YNAB_BASE_URL = "https://api.ynab.com/v1"
 
 app = FastAPI(
     title="YNAB Copilot Middleware",
-    description="Deterministic read-model and guarded write layer between ChatGPT and YNAB",
-    version="3.0.0",
+    description="Deterministic read-model, read-only external reconciliation, and guarded write layer between ChatGPT and YNAB",
+    version="3.2.0",
 )
 
 
@@ -159,6 +159,10 @@ class BudgetStore:
 
         # IMPORTANT: for production/multiple Railway workers, persist this in Redis/Postgres.
         self.proposals: Dict[str, dict] = {}
+
+        # Read-only external reconciliation snapshot. This is deliberately
+        # ephemeral and never writes external data into YNAB.
+        self.reconciliation_snapshot: Optional[Dict[str, Any]] = None
 
     def _slugify(self, text: str) -> str:
         s = re.sub(r"[^\w\s-]", "", text.strip().lower())
@@ -632,6 +636,504 @@ def current_month_categories() -> Dict[str, dict]:
         if not cat.get("deleted", False) and not cat.get("hidden", False)
     }
 
+
+
+# =====================================================================
+# Read-Only External Transaction Reconciliation
+# =====================================================================
+
+class ExternalTransaction(BaseModel):
+    external_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Stable transaction identifier from the external bank/card source",
+    )
+    account: str = Field(
+        ...,
+        description="YNAB account alias, e.g. acct:wf_checking",
+    )
+    posted_date: date
+    authorized_date: Optional[date] = None
+    amount: str = Field(
+        ...,
+        description=(
+            "Signed currency amount using YNAB direction: outflow negative, inflow positive"
+        ),
+    )
+    merchant: Optional[str] = None
+    description: Optional[str] = None
+    pending: bool = False
+    ynab_import_id: Optional[str] = Field(
+        None,
+        description="Optional YNAB import_id when the external source exposes the same identifier",
+    )
+
+
+class ExternalTransactionBatch(BaseModel):
+    source: str = Field(..., min_length=1, max_length=100)
+    transactions: List[ExternalTransaction] = Field(..., min_length=1, max_length=500)
+
+
+def external_transaction_ref(source: str, external_id: str) -> str:
+    digest = hmac.new(
+        REF_SECRET.encode("utf-8"),
+        f"{source}|{external_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:12]
+    return f"x:{digest}"
+
+
+def _safe_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _text_tokens(*values: Optional[str]) -> set[str]:
+    text = " ".join(normalize_text(v) for v in values if v)
+    return {token for token in text.split() if len(token) >= 3}
+
+
+def _external_text_tokens(tx: ExternalTransaction) -> set[str]:
+    return _text_tokens(tx.merchant, tx.description)
+
+
+def _ynab_text_tokens(tx: dict) -> set[str]:
+    return _text_tokens(
+        tx.get("payee_name"),
+        tx.get("import_payee_name"),
+        tx.get("import_payee_name_original"),
+        tx.get("memo"),
+    )
+
+
+def _jaccard_similarity(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def score_external_to_ynab(
+    external: ExternalTransaction,
+    ynab_tx: dict,
+    account_uuid: str,
+) -> Dict[str, Any]:
+    """Score evidence that one external transaction corresponds to one YNAB row."""
+    score = 0
+    reasons: List[str] = []
+
+    if ynab_tx.get("account_id") != account_uuid:
+        return {"score": -999, "reasons": ["different account"], "date_gap": 9999}
+
+    score += 3
+    reasons.append("same account")
+
+    external_amount = str_to_milli(external.amount)
+    ynab_amount = int(ynab_tx.get("amount", 0))
+    amount_delta = abs(external_amount - ynab_amount)
+
+    if amount_delta == 0:
+        score += 4
+        reasons.append("exact amount")
+    elif amount_delta <= 100:
+        score += 1
+        reasons.append("amount within $0.10")
+    else:
+        return {
+            "score": -999,
+            "reasons": ["amount mismatch"],
+            "date_gap": 9999,
+            "amount_delta_milli": amount_delta,
+        }
+
+    ynab_date = _safe_date(ynab_tx.get("date"))
+    comparison_date = external.posted_date
+    date_gap = abs((comparison_date - ynab_date).days) if ynab_date else 9999
+
+    if date_gap == 0:
+        score += 3
+        reasons.append("same posted date")
+    elif date_gap == 1:
+        score += 2
+        reasons.append("posted dates one day apart")
+    elif date_gap == 2:
+        score += 1
+        reasons.append("posted dates two days apart")
+    elif external.authorized_date and ynab_date:
+        auth_gap = abs((external.authorized_date - ynab_date).days)
+        if auth_gap == 0:
+            score += 2
+            reasons.append("YNAB date matches authorization date")
+            date_gap = min(date_gap, auth_gap)
+        elif auth_gap == 1:
+            score += 1
+            reasons.append("YNAB date within one day of authorization")
+            date_gap = min(date_gap, auth_gap)
+
+    if date_gap > 3:
+        return {
+            "score": -999,
+            "reasons": ["date outside matching window"],
+            "date_gap": date_gap,
+            "amount_delta_milli": amount_delta,
+        }
+
+    if (
+        external.ynab_import_id
+        and ynab_tx.get("import_id")
+        and external.ynab_import_id == ynab_tx.get("import_id")
+    ):
+        score += 10
+        reasons.append("exact YNAB import identifier")
+
+    ext_tokens = _external_text_tokens(external)
+    ynab_tokens = _ynab_text_tokens(ynab_tx)
+    similarity = _jaccard_similarity(ext_tokens, ynab_tokens)
+
+    if similarity >= 0.60:
+        score += 3
+        reasons.append("strong merchant/payee text match")
+    elif similarity >= 0.30:
+        score += 2
+        reasons.append("merchant/payee text match")
+    elif ext_tokens & ynab_tokens:
+        score += 1
+        reasons.append("partial merchant/payee text match")
+
+    return {
+        "score": score,
+        "reasons": reasons,
+        "date_gap": date_gap,
+        "amount_delta_milli": amount_delta,
+        "text_similarity": round(similarity, 3),
+    }
+
+
+def reconciliation_confidence(score: int) -> float:
+    # A compact evidence-to-confidence mapping. This is not a statistical
+    # probability; it is a deterministic confidence indicator for review.
+    if score >= 15:
+        return 0.99
+    if score >= 12:
+        return 0.97
+    if score >= 10:
+        return 0.93
+    if score >= 8:
+        return 0.85
+    if score >= 7:
+        return 0.75
+    if score >= 6:
+        return 0.62
+    if score >= 5:
+        return 0.50
+    return 0.0
+
+
+def find_external_transfer_candidates(
+    rows: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Find opposite-amount external rows across different accounts."""
+    by_abs_amount: Dict[int, List[Dict[str, Any]]] = {}
+    for row in rows:
+        if row["pending"]:
+            continue
+        by_abs_amount.setdefault(abs(row["amount_milli"]), []).append(row)
+
+    matches: Dict[str, Dict[str, Any]] = {}
+    for bucket in by_abs_amount.values():
+        for i, a in enumerate(bucket):
+            for b in bucket[i + 1:]:
+                if a["amount_milli"] != -b["amount_milli"]:
+                    continue
+                if a["account"] == b["account"]:
+                    continue
+                gap = abs((date.fromisoformat(a["posted_date"]) - date.fromisoformat(b["posted_date"])).days)
+                if gap > 2:
+                    continue
+                evidence = ["exact opposite amounts", "different accounts"]
+                if gap == 0:
+                    evidence.append("same posted date")
+                else:
+                    evidence.append(f"posted dates {gap} day(s) apart")
+                matches[a["external_ref"]] = {
+                    "candidate_external_ref": b["external_ref"],
+                    "evidence": evidence,
+                }
+                matches[b["external_ref"]] = {
+                    "candidate_external_ref": a["external_ref"],
+                    "evidence": evidence,
+                }
+    return matches
+
+
+def reconcile_external_transactions(
+    source: str,
+    external_transactions: List[ExternalTransaction],
+) -> Dict[str, Any]:
+    """Build a read-only reconciliation report against the current YNAB cache."""
+    normalized: List[Dict[str, Any]] = []
+    for external in external_transactions:
+        account_uuid = store.resolve_uuid(external.account)
+        account = store.accounts.get(account_uuid)
+        if not account or account.get("closed"):
+            raise HTTPException(
+                status_code=404,
+                detail=f"External transaction account {external.account} not found or closed",
+            )
+
+        normalized.append({
+            "external": external,
+            "external_ref": external_transaction_ref(source, external.external_id),
+            "account_uuid": account_uuid,
+            "account": store.uuid_to_alias.get(account_uuid, external.account),
+            "posted_date": external.posted_date.isoformat(),
+            "authorized_date": (
+                external.authorized_date.isoformat()
+                if external.authorized_date else None
+            ),
+            "amount_milli": str_to_milli(external.amount),
+            "amount": milli_to_str(str_to_milli(external.amount)),
+            "merchant": external.merchant or "",
+            "description": external.description or "",
+            "pending": external.pending,
+        })
+
+    transfer_candidates = find_external_transfer_candidates(normalized)
+
+    # Candidate YNAB rows are restricted to the history cache and evaluated by
+    # account, amount and a narrow date window before text evidence is applied.
+    result_rows: List[Dict[str, Any]] = []
+    claimed_ynab: Dict[str, List[str]] = {}
+
+    for row in normalized:
+        external = row["external"]
+        if external.pending:
+            result_rows.append({
+                "external_ref": row["external_ref"],
+                "account": row["account"],
+                "posted_date": row["posted_date"],
+                "authorized_date": row["authorized_date"],
+                "amount": row["amount"],
+                "merchant": row["merchant"],
+                "description": row["description"],
+                "pending": True,
+                "status": "pending",
+                "confidence": 1.0,
+                "ynab_ref": "",
+                "candidate_ynab_refs": [],
+                "evidence": ["external transaction is still pending"],
+                "possible_transfer": bool(transfer_candidates.get(row["external_ref"])),
+                "transfer_candidate_external_ref": (
+                    transfer_candidates.get(row["external_ref"], {}).get(
+                        "candidate_external_ref", ""
+                    )
+                ),
+            })
+            continue
+
+        candidates = []
+        for tx_id, ynab_tx in store.transactions.items():
+            evidence = score_external_to_ynab(
+                external=external,
+                ynab_tx=ynab_tx,
+                account_uuid=row["account_uuid"],
+            )
+            if evidence["score"] < 5:
+                continue
+            candidates.append({
+                "tx_id": tx_id,
+                "ynab_ref": store.transaction_ref(tx_id),
+                **evidence,
+            })
+
+        candidates.sort(
+            key=lambda c: (
+                -c["score"],
+                c.get("date_gap", 9999),
+                c.get("amount_delta_milli", 999999999),
+                c["ynab_ref"],
+            )
+        )
+
+        best = candidates[0] if candidates else None
+        second = candidates[1] if len(candidates) > 1 else None
+
+        if not best:
+            status_name = "bank_only"
+            confidence = 0.0
+            ynab_ref = ""
+            evidence_list = ["no YNAB candidate met the minimum evidence threshold"]
+        else:
+            score = int(best["score"])
+            confidence = reconciliation_confidence(score)
+            ynab_ref = best["ynab_ref"]
+            evidence_list = list(best["reasons"])
+
+            exact_import = "exact YNAB import identifier" in evidence_list
+            close_competitor = bool(second and (score - int(second["score"]) < 2))
+
+            if close_competitor:
+                status_name = "ambiguous"
+                evidence_list.append("multiple YNAB candidates have similar evidence")
+            elif exact_import or score >= 10:
+                status_name = "matched"
+            elif score >= 7:
+                status_name = "probable_match"
+            else:
+                status_name = "ambiguous"
+
+            claimed_ynab.setdefault(best["tx_id"], []).append(row["external_ref"])
+
+        transfer = transfer_candidates.get(row["external_ref"])
+        result_rows.append({
+            "external_ref": row["external_ref"],
+            "account": row["account"],
+            "posted_date": row["posted_date"],
+            "authorized_date": row["authorized_date"],
+            "amount": row["amount"],
+            "merchant": row["merchant"],
+            "description": row["description"],
+            "pending": False,
+            "status": status_name,
+            "confidence": confidence,
+            "ynab_ref": ynab_ref,
+            "candidate_ynab_refs": [c["ynab_ref"] for c in candidates[:3]],
+            "evidence": evidence_list,
+            "possible_transfer": bool(transfer),
+            "transfer_candidate_external_ref": (
+                transfer.get("candidate_external_ref", "") if transfer else ""
+            ),
+        })
+
+    # If multiple external rows claim the same YNAB transaction, surface that
+    # conflict explicitly rather than silently choosing one.
+    conflicts = {
+        tx_id: refs for tx_id, refs in claimed_ynab.items() if len(refs) > 1
+    }
+    if conflicts:
+        conflict_refs = {ref for refs in conflicts.values() for ref in refs}
+        for row in result_rows:
+            if row["external_ref"] in conflict_refs and row["status"] != "pending":
+                row["status"] = "possible_duplicate"
+                row["confidence"] = min(row["confidence"], 0.75)
+                row["evidence"].append(
+                    "multiple external transactions point to the same YNAB transaction"
+                )
+
+    matched_ynab_ids = {
+        store.resolve_uuid(row["ynab_ref"])
+        for row in result_rows
+        if row["ynab_ref"]
+        and row["status"] in {"matched", "probable_match", "possible_duplicate"}
+    }
+
+    # Limit YNAB-only reporting to accounts and date span represented by posted
+    # (non-pending) external data. This prevents an incomplete bank export from
+    # making the entire YNAB history look unmatched.
+    posted_rows = [r for r in normalized if not r["pending"]]
+    ynab_only: List[Dict[str, Any]] = []
+    if posted_rows:
+        account_ids = {r["account_uuid"] for r in posted_rows}
+        min_date = min(date.fromisoformat(r["posted_date"]) for r in posted_rows)
+        max_date = max(date.fromisoformat(r["posted_date"]) for r in posted_rows)
+
+        for tx_id, tx in store.transactions.items():
+            tx_date = _safe_date(tx.get("date"))
+            if (
+                tx.get("account_id") not in account_ids
+                or not tx_date
+                or tx_date < min_date
+                or tx_date > max_date
+                or tx_id in matched_ynab_ids
+            ):
+                continue
+            ynab_only.append({
+                "ynab_ref": store.transaction_ref(tx_id),
+                "date": tx.get("date"),
+                "account": store.uuid_to_alias.get(
+                    tx.get("account_id", ""), tx.get("account_name", "")
+                ),
+                "amount": milli_to_str(int(tx.get("amount", 0))),
+                "payee": tx_display_payee(tx),
+                "cleared": tx.get("cleared"),
+                "approved": bool(tx.get("approved")),
+            })
+
+    counts: Dict[str, int] = {}
+    for row in result_rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    counts["ynab_only"] = len(ynab_only)
+
+    account_summaries: Dict[str, Dict[str, Any]] = {}
+    for row in result_rows:
+        summary = account_summaries.setdefault(
+            row["account"],
+            {
+                "account": row["account"],
+                "external_transaction_count": 0,
+                "matched": 0,
+                "probable_match": 0,
+                "bank_only": 0,
+                "ambiguous": 0,
+                "possible_duplicate": 0,
+                "pending": 0,
+            },
+        )
+        summary["external_transaction_count"] += 1
+        if row["status"] in summary:
+            summary[row["status"]] += 1
+
+    report = {
+        "source": source,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "read_only": True,
+        "external_transaction_count": len(result_rows),
+        "counts": counts,
+        "accounts": sorted(account_summaries.values(), key=lambda x: x["account"]),
+        "transactions": result_rows,
+        "ynab_only": sorted(
+            ynab_only,
+            key=lambda x: (x["date"] or "", x["ynab_ref"]),
+            reverse=True,
+        ),
+        "notes": [
+            "No reconciliation result mutates YNAB.",
+            "Confidence is a deterministic evidence indicator, not a statistical probability.",
+            "Pending external transactions are never treated as posted matches.",
+            "YNAB-only rows are limited to the accounts and posted-date span represented by the submitted external data.",
+        ],
+    }
+    return report
+
+
+@app.post(
+    "/reconciliation/transactions",
+    summary="Read-only external transaction ingestion and YNAB reconciliation",
+    operation_id="ingestExternalTransactions",
+)
+async def ingest_external_transactions(payload: ExternalTransactionBatch):
+    await sync_ynab()
+    report = reconcile_external_transactions(payload.source, payload.transactions)
+    store.reconciliation_snapshot = report
+    return report
+
+
+@app.get(
+    "/reconciliation/status",
+    summary="Retrieve the most recent read-only reconciliation snapshot",
+    operation_id="getReconciliationStatus",
+)
+async def get_reconciliation_status():
+    if not store.reconciliation_snapshot:
+        raise HTTPException(
+            status_code=404,
+            detail="No reconciliation snapshot is available; ingest external transactions first",
+        )
+    return store.reconciliation_snapshot
 
 
 # =====================================================================
