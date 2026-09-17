@@ -81,7 +81,7 @@ YNAB_BASE_URL = "https://api.ynab.com/v1"
 app = FastAPI(
     title="YNAB Copilot Middleware",
     description="Deterministic read-model, Plaid-backed read-only reconciliation, and guarded write layer between ChatGPT and YNAB",
-    version="3.3.2",
+    version="3.3.3",
 )
 
 
@@ -1256,7 +1256,10 @@ def plaid_account_alias(plaid_account_id: str) -> str:
     return str(alias)
 
 
-def plaid_to_external_transaction(transaction: dict) -> ExternalTransaction:
+def plaid_to_external_transaction(
+    transaction: dict,
+    ynab_account_alias: Optional[str] = None,
+) -> ExternalTransaction:
     posted_date = transaction.get("date")
     if not posted_date:
         raise HTTPException(
@@ -1264,9 +1267,12 @@ def plaid_to_external_transaction(transaction: dict) -> ExternalTransaction:
             detail=f"Plaid transaction {transaction.get('transaction_id')} has no posted date",
         )
 
+    plaid_account_id = str(transaction.get("account_id") or "")
+    account_alias = ynab_account_alias or plaid_account_alias(plaid_account_id)
+
     return ExternalTransaction(
         external_id=str(transaction["transaction_id"]),
-        account=plaid_account_alias(str(transaction["account_id"])),
+        account=account_alias,
         posted_date=date.fromisoformat(posted_date),
         authorized_date=(
             date.fromisoformat(transaction["authorized_date"])
@@ -1520,8 +1526,16 @@ async def sync_plaid_transactions():
             continue
         mapped_transactions.append(tx)
 
+    # Pass the already-validated YNAB alias explicitly. This makes the mapped
+    # account boundary authoritative here and prevents an unmapped Plaid account
+    # from reaching plaid_account_alias() during reconciliation.
     external_transactions = [
-        plaid_to_external_transaction(tx)
+        plaid_to_external_transaction(
+            tx,
+            ynab_account_alias=str(
+                PLAID_YNAB_ACCOUNT_MAP[str(tx.get("account_id") or "")]
+            ),
+        )
         for tx in mapped_transactions
     ]
 
