@@ -81,7 +81,7 @@ YNAB_BASE_URL = "https://api.ynab.com/v1"
 app = FastAPI(
     title="YNAB Copilot Middleware",
     description="Deterministic read-model, Plaid-backed read-only reconciliation, and guarded write layer between ChatGPT and YNAB",
-    version="3.3.3",
+    version="3.3.4",
 )
 
 
@@ -1146,6 +1146,45 @@ def reconcile_external_transactions(
     return report
 
 
+def compact_reconciliation_report(
+    report: Dict[str, Any],
+    detail_limit: int = 25,
+) -> Dict[str, Any]:
+    """Return a compact API response while retaining the full report in memory."""
+    transactions = report.get("transactions") or []
+    ynab_only = report.get("ynab_only") or []
+
+    attention = [row for row in transactions if row.get("status") != "matched"]
+    attention.sort(
+        key=lambda row: (row.get("posted_date") or "", row.get("external_ref") or ""),
+        reverse=True,
+    )
+    ynab_only_sorted = sorted(
+        ynab_only,
+        key=lambda row: (row.get("date") or "", row.get("ynab_ref") or ""),
+        reverse=True,
+    )
+
+    return {
+        "source": report.get("source"),
+        "generated_at": report.get("generated_at"),
+        "read_only": report.get("read_only", True),
+        "external_transaction_count": report.get(
+            "external_transaction_count", len(transactions)
+        ),
+        "counts": report.get("counts", {}),
+        "accounts": report.get("accounts", []),
+        "attention_transaction_count": len(attention),
+        "ynab_only_count": len(ynab_only),
+        "attention_transactions": attention[:detail_limit],
+        "ynab_only": ynab_only_sorted[:detail_limit],
+        "detail_limit": detail_limit,
+        "has_more_attention_transactions": len(attention) > detail_limit,
+        "has_more_ynab_only": len(ynab_only) > detail_limit,
+        "notes": report.get("notes", []),
+    }
+
+
 @app.post(
     "/reconciliation/transactions",
     summary="Read-only external transaction ingestion and YNAB reconciliation",
@@ -1155,7 +1194,7 @@ async def ingest_external_transactions(payload: ExternalTransactionBatch):
     await sync_ynab()
     report = reconcile_external_transactions(payload.source, payload.transactions)
     store.reconciliation_snapshot = report
-    return report
+    return compact_reconciliation_report(report, detail_limit=25)
 
 
 @app.get(
@@ -1169,7 +1208,10 @@ async def get_reconciliation_status():
             status_code=404,
             detail="No reconciliation snapshot is available; ingest external transactions first",
         )
-    return store.reconciliation_snapshot
+    return compact_reconciliation_report(
+        store.reconciliation_snapshot,
+        detail_limit=25,
+    )
 
 
 # =====================================================================
@@ -1572,7 +1614,10 @@ async def sync_plaid_transactions():
             "mapped_account_ids": sorted(mapped_account_ids),
             "cursor_present": bool(store.plaid_cursor),
         },
-        "reconciliation": report,
+        "reconciliation": compact_reconciliation_report(
+            report,
+            detail_limit=25,
+        ),
     }
 
 
