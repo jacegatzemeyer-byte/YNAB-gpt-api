@@ -81,7 +81,7 @@ YNAB_BASE_URL = "https://api.ynab.com/v1"
 app = FastAPI(
     title="YNAB Copilot Middleware",
     description="Deterministic read-model, Plaid-backed read-only reconciliation, and guarded write layer between ChatGPT and YNAB",
-    version="3.3.4",
+    version="3.4.0",
 )
 
 
@@ -199,6 +199,12 @@ class BudgetStore:
         self.plaid_item_id: str = PLAID_ITEM_ID
         self.plaid_cursor: Optional[str] = None
         self.plaid_transactions: Dict[str, dict] = {}
+
+        # Small, non-sensitive cache of Plaid account balance metadata. This lets
+        # budget/cashflow endpoints compare the bank-side balance with YNAB
+        # without returning or retaining raw account credentials.
+        self.plaid_account_balances: Dict[str, dict] = {}
+        self.plaid_balance_sync_time: float = 0.0
 
     def _slugify(self, text: str) -> str:
         s = re.sub(r"[^\w\s-]", "", text.strip().lower())
@@ -1275,6 +1281,135 @@ async def plaid_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+async def refresh_plaid_account_balances(force: bool = False) -> Dict[str, dict]:
+    """Refresh a compact cache of Plaid account balances.
+
+    A Plaid balance read must never be required for ordinary YNAB reads to work.
+    Callers that need graceful degradation should catch HTTPException.
+    """
+    access_token = store.plaid_access_token or PLAID_ACCESS_TOKEN
+    if not access_token:
+        raise HTTPException(status_code=409, detail="No Plaid Item access token is configured")
+
+    now = time.time()
+    if (
+        not force
+        and store.plaid_account_balances
+        and now - store.plaid_balance_sync_time < 60
+    ):
+        return store.plaid_account_balances
+
+    data = await plaid_post("/accounts/get", {"access_token": access_token})
+    compact: Dict[str, dict] = {}
+    for account in data.get("accounts", []):
+        plaid_id = str(account.get("account_id") or "")
+        if not plaid_id:
+            continue
+        balances = account.get("balances") or {}
+        compact[plaid_id] = {
+            "plaid_account_id": plaid_id,
+            "name": account.get("name"),
+            "official_name": account.get("official_name"),
+            "type": account.get("type"),
+            "subtype": account.get("subtype"),
+            "mask": account.get("mask"),
+            "ynab_account": PLAID_YNAB_ACCOUNT_MAP.get(plaid_id, ""),
+            "mapped": plaid_id in PLAID_YNAB_ACCOUNT_MAP,
+            "current": balances.get("current"),
+            "available": balances.get("available"),
+            "iso_currency_code": balances.get("iso_currency_code"),
+        }
+
+    store.plaid_account_balances = compact
+    store.plaid_balance_sync_time = now
+    return compact
+
+
+def decimal_currency_to_milli(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(
+            (Decimal(str(value)) * 1000).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+    except Exception:
+        return None
+
+
+async def primary_checking_balance_diagnostic(
+    refresh_bank: bool = False,
+) -> Dict[str, Any]:
+    """Compare the mapped bank-side primary checking balance with YNAB."""
+    checking_ids = get_primary_checking_ids()
+    ynab_milli = sum(
+        int(store.accounts[acct_id].get("balance", 0))
+        for acct_id in checking_ids
+    )
+
+    result: Dict[str, Any] = {
+        "ynab_balance": milli_to_str(ynab_milli),
+        "bank_current_balance": None,
+        "bank_available_balance": None,
+        "difference_bank_minus_ynab": None,
+        "bank_balance_available": False,
+        "bank_balance_as_of": None,
+        "mapped_plaid_accounts": 0,
+    }
+
+    if not checking_ids or not (store.plaid_access_token or PLAID_ACCESS_TOKEN):
+        return result
+
+    try:
+        balances = await refresh_plaid_account_balances(force=refresh_bank)
+    except HTTPException as exc:
+        result["bank_balance_error"] = str(exc.detail)
+        return result
+    except Exception as exc:
+        result["bank_balance_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+    current_total = 0
+    available_total = 0
+    current_count = 0
+    available_count = 0
+    mapped_count = 0
+
+    for plaid_id, row in balances.items():
+        ynab_alias = PLAID_YNAB_ACCOUNT_MAP.get(plaid_id)
+        if not ynab_alias:
+            continue
+        ynab_uuid = store.resolve_uuid(str(ynab_alias))
+        if ynab_uuid not in checking_ids:
+            continue
+
+        mapped_count += 1
+        current_milli = decimal_currency_to_milli(row.get("current"))
+        available_milli = decimal_currency_to_milli(row.get("available"))
+        if current_milli is not None:
+            current_total += current_milli
+            current_count += 1
+        if available_milli is not None:
+            available_total += available_milli
+            available_count += 1
+
+    result["mapped_plaid_accounts"] = mapped_count
+    if current_count:
+        result["bank_current_balance"] = milli_to_str(current_total)
+        result["difference_bank_minus_ynab"] = milli_to_str(current_total - ynab_milli)
+        result["bank_balance_available"] = True
+    if available_count:
+        result["bank_available_balance"] = milli_to_str(available_total)
+
+    if store.plaid_balance_sync_time:
+        result["bank_balance_as_of"] = datetime.fromtimestamp(
+            store.plaid_balance_sync_time, tz=timezone.utc
+        ).isoformat()
+
+    return result
+
+
 def plaid_amount_to_ynab_string(transaction: dict) -> str:
     """Plaid positive transaction amounts are typically money leaving the account.
 
@@ -1471,30 +1606,17 @@ async def exchange_plaid_hosted_link(payload: PlaidLinkExchangeRequest):
     operation_id="getPlaidAccounts",
 )
 async def get_plaid_accounts():
-    access_token = store.plaid_access_token or PLAID_ACCESS_TOKEN
-    if not access_token:
-        raise HTTPException(
-            status_code=409,
-            detail="No Plaid Item access token is configured",
-        )
-    data = await plaid_post("/accounts/get", {"access_token": access_token})
-    accounts = []
-    for account in data.get("accounts", []):
-        plaid_id = str(account.get("account_id") or "")
-        accounts.append({
-            "plaid_account_id": plaid_id,
-            "name": account.get("name"),
-            "official_name": account.get("official_name"),
-            "type": account.get("type"),
-            "subtype": account.get("subtype"),
-            "mask": account.get("mask"),
-            "ynab_account": PLAID_YNAB_ACCOUNT_MAP.get(plaid_id, ""),
-            "mapped": plaid_id in PLAID_YNAB_ACCOUNT_MAP,
-        })
+    balances = await refresh_plaid_account_balances(force=True)
+    accounts = list(balances.values())
+    accounts.sort(key=lambda row: ((row.get("name") or "").lower(), row["plaid_account_id"]))
     return {
         "item_id": store.plaid_item_id or PLAID_ITEM_ID,
+        "balance_as_of": datetime.fromtimestamp(
+            store.plaid_balance_sync_time, tz=timezone.utc
+        ).isoformat() if store.plaid_balance_sync_time else None,
         "accounts": accounts,
     }
+
 
 
 @app.post(
@@ -1554,6 +1676,10 @@ async def sync_plaid_transactions():
 
     store.plaid_cursor = cursor
 
+    # Refresh mapped account balances after transaction sync. This is a small
+    # response and gives downstream affordability logic a bank-side starting point.
+    await refresh_plaid_account_balances(force=True)
+
     mapped_account_ids = set(PLAID_YNAB_ACCOUNT_MAP.keys())
     mapped_transactions = []
     skipped_unmapped_account_ids = set()
@@ -1601,6 +1727,7 @@ async def sync_plaid_transactions():
         report = reconcile_external_transactions("plaid", external_transactions)
 
     store.reconciliation_snapshot = report
+    balance_diagnostic = await primary_checking_balance_diagnostic(refresh_bank=False)
 
     return {
         "plaid_sync": {
@@ -1614,6 +1741,7 @@ async def sync_plaid_transactions():
             "mapped_account_ids": sorted(mapped_account_ids),
             "cursor_present": bool(store.plaid_cursor),
         },
+        "primary_checking_balance": balance_diagnostic,
         "reconciliation": compact_reconciliation_report(
             report,
             detail_limit=25,
@@ -1917,6 +2045,102 @@ def build_reallocation_plan(
 # Read Models
 # =====================================================================
 
+@app.get(
+    "/health/middleware",
+    summary="Compact YNAB/Plaid/middleware capability diagnostics",
+    operation_id="getMiddlewareHealth",
+)
+async def get_middleware_health():
+    """Return non-secret operational diagnostics for this Custom GPT."""
+    ynab_ok = True
+    ynab_error = None
+    try:
+        await sync_ynab()
+    except Exception as exc:
+        ynab_ok = False
+        ynab_error = f"{type(exc).__name__}: {exc}"
+
+    balance_diagnostic: Dict[str, Any] = {}
+    plaid_ok = bool(store.plaid_access_token or PLAID_ACCESS_TOKEN)
+    plaid_error = None
+    if plaid_ok and ynab_ok:
+        try:
+            balance_diagnostic = await primary_checking_balance_diagnostic(
+                refresh_bank=True
+            )
+        except Exception as exc:
+            plaid_ok = False
+            plaid_error = f"{type(exc).__name__}: {exc}"
+
+    snapshot = store.reconciliation_snapshot or {}
+    reconciliation_available = bool(snapshot)
+    reconciliation_generated_at = snapshot.get("generated_at")
+
+    mapped_accounts = len(PLAID_YNAB_ACCOUNT_MAP)
+    primary_checking_ids = get_primary_checking_ids() if ynab_ok else set()
+
+    checks = {
+        "ynab_read": ynab_ok,
+        "plaid_configured": bool(store.plaid_access_token or PLAID_ACCESS_TOKEN),
+        "plaid_read": plaid_ok,
+        "plaid_mapping_present": mapped_accounts > 0,
+        "primary_checking_found": bool(primary_checking_ids),
+        "bank_balance_available": bool(
+            balance_diagnostic.get("bank_balance_available")
+        ),
+        "reconciliation_snapshot_available": reconciliation_available,
+        "guarded_writes_enabled": True,
+    }
+    healthy = all(
+        checks[name]
+        for name in (
+            "ynab_read",
+            "plaid_configured",
+            "plaid_read",
+            "plaid_mapping_present",
+            "primary_checking_found",
+            "bank_balance_available",
+            "guarded_writes_enabled",
+        )
+    )
+
+    return {
+        "service": "YNAB Copilot Middleware",
+        "version": app.version,
+        "healthy": healthy,
+        "checks": checks,
+        "ynab_error": ynab_error,
+        "plaid_error": plaid_error,
+        "mapped_plaid_account_count": mapped_accounts,
+        "primary_checking_balance": balance_diagnostic,
+        "reconciliation": {
+            "available": reconciliation_available,
+            "generated_at": reconciliation_generated_at,
+            "counts": snapshot.get("counts", {}) if snapshot else {},
+        },
+        "cache": {
+            "ynab_last_sync_utc": (
+                datetime.fromtimestamp(
+                    store.last_sync_time, tz=timezone.utc
+                ).isoformat()
+                if store.last_sync_time else None
+            ),
+            "plaid_balance_last_sync_utc": (
+                datetime.fromtimestamp(
+                    store.plaid_balance_sync_time, tz=timezone.utc
+                ).isoformat()
+                if store.plaid_balance_sync_time else None
+            ),
+            "plaid_cached_transaction_count": len(store.plaid_transactions),
+        },
+        "write_safety": {
+            "direct_ynab_writes_exposed": False,
+            "proposal_required": True,
+            "explicit_commit_required": True,
+        },
+    }
+
+
 @app.get("/", summary="Health check")
 async def root():
     return {"status": "online", "service": "YNAB Copilot Middleware", "version": app.version}
@@ -1941,6 +2165,17 @@ async def get_current_context():
         if acct_id in get_primary_checking_ids()
     )
     above_floor_milli = checking_balance_milli - CHECKING_FLOOR_MILLI
+    balance_diagnostic = await primary_checking_balance_diagnostic(refresh_bank=False)
+
+    bank_current_milli = (
+        str_to_milli(balance_diagnostic["bank_current_balance"])
+        if balance_diagnostic.get("bank_current_balance") is not None
+        else None
+    )
+    bank_above_floor_milli = (
+        bank_current_milli - CHECKING_FLOOR_MILLI
+        if bank_current_milli is not None else None
+    )
 
     overspent = []
     overspent_total_milli = 0
@@ -2020,10 +2255,33 @@ async def get_current_context():
         "as_of": today.isoformat(),
         "ready_to_assign": milli_to_str(rta_milli),
         "checking": {
+            # Backward-compatible YNAB values.
             "balance": milli_to_str(checking_balance_milli),
+            "ynab_balance": milli_to_str(checking_balance_milli),
             "floor": milli_to_str(CHECKING_FLOOR_MILLI),
             "above_floor": milli_to_str(above_floor_milli),
             "floor_breached": above_floor_milli < 0,
+
+            # Bank-side truth when Plaid is available.
+            "bank_current_balance": balance_diagnostic.get("bank_current_balance"),
+            "bank_available_balance": balance_diagnostic.get("bank_available_balance"),
+            "bank_above_floor": (
+                milli_to_str(bank_above_floor_milli)
+                if bank_above_floor_milli is not None else None
+            ),
+            "bank_floor_breached": (
+                bank_above_floor_milli < 0
+                if bank_above_floor_milli is not None else None
+            ),
+            "difference_bank_minus_ynab": balance_diagnostic.get(
+                "difference_bank_minus_ynab"
+            ),
+            "bank_balance_as_of": balance_diagnostic.get("bank_balance_as_of"),
+            "balance_source_for_affordability": (
+                "plaid_current"
+                if balance_diagnostic.get("bank_balance_available")
+                else "ynab"
+            ),
         },
         "overspent_category_count": len(overspent),
         "overspent_total": milli_to_str(overspent_total_milli),
@@ -2317,6 +2575,39 @@ async def get_triage(
     return output.getvalue()
 
 
+class TriageQueryRequest(BaseModel):
+    format: Literal["csv", "json"] = "json"
+    status: Literal[
+        "actionable",
+        "needs_category",
+        "needs_approval_only",
+        "possible_transfer",
+        "possible_duplicate",
+        "unapproved",
+        "uncategorized",
+        "all",
+    ] = "actionable"
+    limit: int = Field(50, ge=1, le=100)
+    since_days: int = Field(45, ge=1, le=HISTORY_DAYS)
+    account: Optional[str] = None
+
+
+@app.post(
+    "/ynab/triage/query",
+    summary="Actionable transaction triage using a JSON request body",
+    operation_id="getTriageQuery",
+)
+async def get_triage_query(payload: TriageQueryRequest):
+    """Body-based triage endpoint for clients that mishandle account query strings."""
+    return await get_triage(
+        format=payload.format,
+        status_filter=payload.status,
+        limit=payload.limit,
+        since_days=payload.since_days,
+        account=payload.account,
+    )
+
+
 @app.get(
     "/ynab/merchant/{name}/history",
     summary="Historical category evidence using canonical and imported payee text",
@@ -2383,10 +2674,25 @@ async def get_cashflow(days: int = Query(30, ge=7, le=90)):
     if not checking_ids:
         raise HTTPException(status_code=500, detail="Primary checking account not found")
 
-    starting_milli = sum(
+    ynab_starting_milli = sum(
         int(store.accounts[acct_id].get("balance", 0))
         for acct_id in checking_ids
     )
+    balance_diagnostic = await primary_checking_balance_diagnostic(refresh_bank=False)
+    bank_starting_milli = (
+        str_to_milli(balance_diagnostic["bank_current_balance"])
+        if balance_diagnostic.get("bank_current_balance") is not None
+        else None
+    )
+
+    # Prefer the bank-side current balance for liquidity decisions when Plaid is
+    # available. Fall back to YNAB so the endpoint remains useful during Plaid outages.
+    starting_milli = (
+        bank_starting_milli
+        if bank_starting_milli is not None
+        else ynab_starting_milli
+    )
+    starting_source = "plaid_current" if bank_starting_milli is not None else "ynab"
 
     # Existing credit-card debt is future cash exposure even when the actual
     # checking payment has not yet been scheduled. We report it separately and
@@ -2509,6 +2815,12 @@ async def get_cashflow(days: int = Query(30, ge=7, le=90)):
     return {
         "forecast_days": days,
         "starting_checking": milli_to_str(starting_milli),
+        "starting_checking_source": starting_source,
+        "ynab_starting_checking": milli_to_str(ynab_starting_milli),
+        "bank_current_checking": balance_diagnostic.get("bank_current_balance"),
+        "bank_available_checking": balance_diagnostic.get("bank_available_balance"),
+        "bank_minus_ynab": balance_diagnostic.get("difference_bank_minus_ynab"),
+        "bank_balance_as_of": balance_diagnostic.get("bank_balance_as_of"),
         "known_checking_inflows": milli_to_str(inflows),
         "known_checking_outflows": milli_to_str(outflows),
         # Backward-compatible fields.
