@@ -36,7 +36,10 @@ YNAB_BUDGET_ID = require_env("YNAB_BUDGET_ID")
 MIDDLEWARE_API_KEY = require_env("MIDDLEWARE_API_KEY")
 REF_SECRET = require_env("REF_SECRET")
 
-PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+PUBLIC_BASE_URL = (
+    os.getenv("PUBLIC_BASE_URL")
+    or "https://blissful-flow-production.up.railway.app"
+).strip().rstrip("/")
 PRIMARY_CHECKING_NAME = (os.getenv("PRIMARY_CHECKING_NAME") or "WF Checking").strip().lower()
 CHECKING_FLOOR_MILLI = int(
     (Decimal(os.getenv("CHECKING_FLOOR", "1000.00")) * 1000).quantize(
@@ -81,7 +84,7 @@ YNAB_BASE_URL = "https://api.ynab.com/v1"
 app = FastAPI(
     title="YNAB Copilot Middleware",
     description="Deterministic read-model, Plaid-backed read-only reconciliation, and guarded write layer between ChatGPT and YNAB",
-    version="3.4.0",
+    version="3.4.1",
 )
 
 
@@ -102,6 +105,15 @@ def custom_openapi():
         "name": "X-API-Key",
     }
     schema["security"] = [{"ApiKeyAuth": []}]
+
+    # Public health/docs routes do not require the API key at runtime. Mark them
+    # the same way in OpenAPI so Action clients do not infer a credential
+    # requirement for simple connectivity tests.
+    for public_path in ("/", "/healthz", "/docs", "/openapi.json", "/redoc"):
+        for operation in (schema.get("paths", {}).get(public_path) or {}).values():
+            if isinstance(operation, dict):
+                operation["security"] = []
+
     app.openapi_schema = schema
     return schema
 
@@ -111,7 +123,7 @@ app.openapi = custom_openapi
 
 @app.middleware("http")
 async def authenticate_all_requests(request: Request, call_next):
-    if request.url.path in ["/", "/docs", "/openapi.json", "/redoc"]:
+    if request.url.path in ["/", "/healthz", "/docs", "/openapi.json", "/redoc"]:
         return await call_next(request)
 
     raw_header = (
@@ -2141,9 +2153,29 @@ async def get_middleware_health():
     }
 
 
-@app.get("/", summary="Health check")
+@app.get("/", summary="Health check", operation_id="rootHealth")
 async def root():
-    return {"status": "online", "service": "YNAB Copilot Middleware", "version": app.version}
+    return {
+        "status": "online",
+        "service": "YNAB Copilot Middleware",
+        "version": app.version,
+    }
+
+
+@app.get(
+    "/healthz",
+    summary="Unauthenticated deployment connectivity check",
+    operation_id="getPublicHealth",
+)
+async def public_health():
+    """Small public probe used only to verify deployment and Action routing."""
+    return {
+        "status": "online",
+        "service": "YNAB Copilot Middleware",
+        "version": app.version,
+        "public_base_url": PUBLIC_BASE_URL,
+        "authenticated_budget_endpoints": True,
+    }
 
 
 @app.get(
@@ -2172,9 +2204,23 @@ async def get_current_context():
         if balance_diagnostic.get("bank_current_balance") is not None
         else None
     )
+    bank_available_milli = (
+        str_to_milli(balance_diagnostic["bank_available_balance"])
+        if balance_diagnostic.get("bank_available_balance") is not None
+        else None
+    )
+    conservative_bank_milli = (
+        bank_available_milli
+        if bank_available_milli is not None
+        else bank_current_milli
+    )
     bank_above_floor_milli = (
         bank_current_milli - CHECKING_FLOOR_MILLI
         if bank_current_milli is not None else None
+    )
+    conservative_above_floor_milli = (
+        conservative_bank_milli - CHECKING_FLOOR_MILLI
+        if conservative_bank_milli is not None else None
     )
 
     overspent = []
@@ -2277,10 +2323,29 @@ async def get_current_context():
                 "difference_bank_minus_ynab"
             ),
             "bank_balance_as_of": balance_diagnostic.get("bank_balance_as_of"),
+            "conservative_liquidity_balance": (
+                milli_to_str(conservative_bank_milli)
+                if conservative_bank_milli is not None
+                else milli_to_str(checking_balance_milli)
+            ),
+            "conservative_above_floor": (
+                milli_to_str(conservative_above_floor_milli)
+                if conservative_above_floor_milli is not None
+                else milli_to_str(above_floor_milli)
+            ),
+            "conservative_floor_breached": (
+                conservative_above_floor_milli < 0
+                if conservative_above_floor_milli is not None
+                else above_floor_milli < 0
+            ),
             "balance_source_for_affordability": (
-                "plaid_current"
-                if balance_diagnostic.get("bank_balance_available")
-                else "ynab"
+                "plaid_available"
+                if bank_available_milli is not None
+                else (
+                    "plaid_current"
+                    if bank_current_milli is not None
+                    else "ynab"
+                )
             ),
         },
         "overspent_category_count": len(overspent),
@@ -2819,6 +2884,20 @@ async def get_cashflow(days: int = Query(30, ge=7, le=90)):
         "ynab_starting_checking": milli_to_str(ynab_starting_milli),
         "bank_current_checking": balance_diagnostic.get("bank_current_balance"),
         "bank_available_checking": balance_diagnostic.get("bank_available_balance"),
+        "immediate_liquidity_checking": (
+            balance_diagnostic.get("bank_available_balance")
+            or balance_diagnostic.get("bank_current_balance")
+            or milli_to_str(ynab_starting_milli)
+        ),
+        "immediate_liquidity_source": (
+            "plaid_available"
+            if balance_diagnostic.get("bank_available_balance") is not None
+            else (
+                "plaid_current"
+                if balance_diagnostic.get("bank_current_balance") is not None
+                else "ynab"
+            )
+        ),
         "bank_minus_ynab": balance_diagnostic.get("difference_bank_minus_ynab"),
         "bank_balance_as_of": balance_diagnostic.get("bank_balance_as_of"),
         "known_checking_inflows": milli_to_str(inflows),
