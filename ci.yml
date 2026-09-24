@@ -1,0 +1,42 @@
+name: middleware-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Compile
+        run: python -m py_compile main.py
+      - name: Import and build OpenAPI
+        env:
+          YNAB_API_TOKEN: test
+          YNAB_BUDGET_ID: test
+          MIDDLEWARE_API_KEY: test
+          REF_SECRET: test
+          PLAID_ENV: sandbox
+          PLAID_ITEMS_JSON: "[]"
+          PLAID_YNAB_ACCOUNT_MAP: "{}"
+        run: |
+          python - <<'PY'
+          import main
+          assert main.app.version == "3.6.0"
+          schema = main.app.openapi()
+          ids = []
+          for methods in schema["paths"].values():
+              for op in methods.values():
+                  if isinstance(op, dict) and op.get("operationId"):
+                      ids.append(op["operationId"])
+          assert len(ids) == len(set(ids)), "duplicate operationId"
+          assert "getPlaidMappings" in ids
+          assert "setPlaidAccountMapping" in ids
+          print(f"OpenAPI smoke test passed: {len(schema['paths'])} paths")
+          PY
