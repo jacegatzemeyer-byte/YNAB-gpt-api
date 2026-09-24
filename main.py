@@ -58,6 +58,11 @@ PLAID_SECRET = (os.getenv("PLAID_SECRET") or "").strip()
 PLAID_ENV = (os.getenv("PLAID_ENV") or "production").strip().lower()
 PLAID_ACCESS_TOKEN = (os.getenv("PLAID_ACCESS_TOKEN") or "").strip()
 PLAID_ITEM_ID = (os.getenv("PLAID_ITEM_ID") or "").strip()
+# Multi-institution registry. Store a JSON array of objects such as:
+# [{"item_id":"...","access_token":"...","institution_name":"Wells Fargo"}, ...]
+# The legacy PLAID_ACCESS_TOKEN / PLAID_ITEM_ID pair is still accepted and is
+# automatically merged into this registry for backwards compatibility.
+PLAID_ITEMS_JSON_RAW = (os.getenv("PLAID_ITEMS_JSON") or "[]").strip()
 PLAID_YNAB_ACCOUNT_MAP_RAW = (os.getenv("PLAID_YNAB_ACCOUNT_MAP") or "{}").strip()
 PLAID_DAYS_REQUESTED = int(os.getenv("PLAID_DAYS_REQUESTED", "365"))
 
@@ -79,12 +84,27 @@ except json.JSONDecodeError as exc:
 if not isinstance(PLAID_YNAB_ACCOUNT_MAP, dict):
     raise RuntimeError("PLAID_YNAB_ACCOUNT_MAP must be a JSON object")
 
+try:
+    PLAID_ITEMS_CONFIG = json.loads(PLAID_ITEMS_JSON_RAW)
+except json.JSONDecodeError as exc:
+    raise RuntimeError("PLAID_ITEMS_JSON must be valid JSON") from exc
+if not isinstance(PLAID_ITEMS_CONFIG, list):
+    raise RuntimeError("PLAID_ITEMS_JSON must be a JSON array")
+
+for index, item in enumerate(PLAID_ITEMS_CONFIG):
+    if not isinstance(item, dict):
+        raise RuntimeError(f"PLAID_ITEMS_JSON[{index}] must be an object")
+    if not str(item.get("item_id") or "").strip() or not str(item.get("access_token") or "").strip():
+        raise RuntimeError(
+            f"PLAID_ITEMS_JSON[{index}] must include non-empty item_id and access_token"
+        )
+
 YNAB_BASE_URL = "https://api.ynab.com/v1"
 
 app = FastAPI(
     title="YNAB Copilot Middleware",
     description="Deterministic read-model, Plaid-backed read-only reconciliation, and guarded write layer between ChatGPT and YNAB",
-    version="3.4.1",
+    version="3.5.1",
 )
 
 
@@ -205,18 +225,44 @@ class BudgetStore:
         # ephemeral and never writes external data into YNAB.
         self.reconciliation_snapshot: Optional[Dict[str, Any]] = None
 
-        # Runtime Plaid state. Production credentials should be persisted as
-        # Railway secrets / a secret-capable datastore, not only in memory.
-        self.plaid_access_token: str = PLAID_ACCESS_TOKEN
-        self.plaid_item_id: str = PLAID_ITEM_ID
-        self.plaid_cursor: Optional[str] = None
+        # Runtime Plaid registry. One Plaid Item represents one institution/login
+        # relationship. The registry supports any number of institutions in the
+        # same household. Durable production state should be mirrored in
+        # PLAID_ITEMS_JSON or, preferably, a secret-capable datastore.
+        self.plaid_items: Dict[str, dict] = {}
+        for configured in PLAID_ITEMS_CONFIG:
+            item_id = str(configured.get("item_id") or "").strip()
+            if not item_id:
+                continue
+            self.plaid_items[item_id] = {
+                "item_id": item_id,
+                "access_token": str(configured.get("access_token") or "").strip(),
+                "institution_id": str(configured.get("institution_id") or "").strip(),
+                "institution_name": str(configured.get("institution_name") or "").strip(),
+                "cursor": None,
+                "transactions": {},
+            }
+
+        # Backwards-compatible migration path for the original single-Item
+        # Railway variables. Do not overwrite an explicitly configured Item.
+        if PLAID_ACCESS_TOKEN and PLAID_ITEM_ID and PLAID_ITEM_ID not in self.plaid_items:
+            self.plaid_items[PLAID_ITEM_ID] = {
+                "item_id": PLAID_ITEM_ID,
+                "access_token": PLAID_ACCESS_TOKEN,
+                "institution_id": "",
+                "institution_name": "",
+                "cursor": None,
+                "transactions": {},
+            }
+
+        # Aggregate external transaction cache. Keys are namespaced by Item to
+        # avoid collisions when multiple institutions are connected.
         self.plaid_transactions: Dict[str, dict] = {}
 
-        # Small, non-sensitive cache of Plaid account balance metadata. This lets
-        # budget/cashflow endpoints compare the bank-side balance with YNAB
-        # without returning or retaining raw account credentials.
+        # Compact balance metadata across all connected Plaid Items.
         self.plaid_account_balances: Dict[str, dict] = {}
         self.plaid_balance_sync_time: float = 0.0
+        self.plaid_item_errors: Dict[str, str] = {}
 
     def _slugify(self, text: str) -> str:
         s = re.sub(r"[^\w\s-]", "", text.strip().lower())
@@ -1233,7 +1279,7 @@ async def get_reconciliation_status():
 
 
 # =====================================================================
-# Plaid Read-Only Ingestion
+# Plaid Read-Only Ingestion — Multi-Institution
 # =====================================================================
 
 class PlaidHostedLinkRequest(BaseModel):
@@ -1254,8 +1300,9 @@ class PlaidLinkExchangeRequest(BaseModel):
     reveal_access_token: bool = Field(
         False,
         description=(
-            "If true, return the newly created Item access_token once so it can "
-            "be stored as a Railway secret. Do not expose this response publicly."
+            "If true, return newly created Item access tokens once so they can "
+            "be persisted in PLAID_ITEMS_JSON or another secret-capable datastore. "
+            "Do not expose this response publicly."
         ),
     )
 
@@ -1293,15 +1340,55 @@ async def plaid_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
-async def refresh_plaid_account_balances(force: bool = False) -> Dict[str, dict]:
-    """Refresh a compact cache of Plaid account balances.
+def plaid_items() -> List[dict]:
+    """Return configured/runtime Plaid Items without exposing tokens."""
+    rows = []
+    for item_id, item in store.plaid_items.items():
+        rows.append({
+            "item_id": item_id,
+            "institution_id": item.get("institution_id") or "",
+            "institution_name": item.get("institution_name") or "",
+            "cursor_present": bool(item.get("cursor")),
+            "cached_transaction_count": len(item.get("transactions") or {}),
+        })
+    rows.sort(key=lambda row: ((row.get("institution_name") or "").lower(), row["item_id"]))
+    return rows
 
-    A Plaid balance read must never be required for ordinary YNAB reads to work.
-    Callers that need graceful degradation should catch HTTPException.
-    """
-    access_token = store.plaid_access_token or PLAID_ACCESS_TOKEN
+
+async def hydrate_plaid_item_metadata(item: dict) -> None:
+    """Best-effort institution metadata lookup for one Item."""
+    access_token = str(item.get("access_token") or "")
     if not access_token:
-        raise HTTPException(status_code=409, detail="No Plaid Item access token is configured")
+        return
+    try:
+        item_data = await plaid_post("/item/get", {"access_token": access_token})
+        plaid_item = item_data.get("item") or {}
+        institution_id = str(plaid_item.get("institution_id") or "")
+        item["institution_id"] = institution_id
+        if institution_id and not item.get("institution_name"):
+            institution = await plaid_post(
+                "/institutions/get_by_id",
+                {
+                    "institution_id": institution_id,
+                    "country_codes": ["US"],
+                },
+            )
+            item["institution_name"] = (
+                (institution.get("institution") or {}).get("name") or ""
+            )
+    except Exception:
+        # Metadata is useful but must never make balance/transaction reads fail.
+        return
+
+
+async def refresh_plaid_account_balances(force: bool = False) -> Dict[str, dict]:
+    """Refresh balances across every connected Plaid Item.
+
+    One institution failing does not hide healthy institutions. Item-level
+    failures are exposed through ``store.plaid_item_errors`` and health output.
+    """
+    if not store.plaid_items:
+        raise HTTPException(status_code=409, detail="No Plaid Items are configured")
 
     now = time.time()
     if (
@@ -1311,29 +1398,51 @@ async def refresh_plaid_account_balances(force: bool = False) -> Dict[str, dict]
     ):
         return store.plaid_account_balances
 
-    data = await plaid_post("/accounts/get", {"access_token": access_token})
     compact: Dict[str, dict] = {}
-    for account in data.get("accounts", []):
-        plaid_id = str(account.get("account_id") or "")
-        if not plaid_id:
+    errors: Dict[str, str] = {}
+
+    for item_id, item in list(store.plaid_items.items()):
+        access_token = str(item.get("access_token") or "")
+        if not access_token:
+            errors[item_id] = "missing access_token"
             continue
-        balances = account.get("balances") or {}
-        compact[plaid_id] = {
-            "plaid_account_id": plaid_id,
-            "name": account.get("name"),
-            "official_name": account.get("official_name"),
-            "type": account.get("type"),
-            "subtype": account.get("subtype"),
-            "mask": account.get("mask"),
-            "ynab_account": PLAID_YNAB_ACCOUNT_MAP.get(plaid_id, ""),
-            "mapped": plaid_id in PLAID_YNAB_ACCOUNT_MAP,
-            "current": balances.get("current"),
-            "available": balances.get("available"),
-            "iso_currency_code": balances.get("iso_currency_code"),
-        }
+
+        try:
+            await hydrate_plaid_item_metadata(item)
+            data = await plaid_post("/accounts/get", {"access_token": access_token})
+        except HTTPException as exc:
+            errors[item_id] = str(exc.detail)
+            continue
+        except Exception as exc:
+            errors[item_id] = f"{type(exc).__name__}: {exc}"
+            continue
+
+        for account in data.get("accounts", []):
+            plaid_id = str(account.get("account_id") or "")
+            if not plaid_id:
+                continue
+            balances = account.get("balances") or {}
+            compact[plaid_id] = {
+                "plaid_account_id": plaid_id,
+                "item_id": item_id,
+                "institution_id": item.get("institution_id") or "",
+                "institution_name": item.get("institution_name") or "",
+                "name": account.get("name"),
+                "official_name": account.get("official_name"),
+                "type": account.get("type"),
+                "subtype": account.get("subtype"),
+                "mask": account.get("mask"),
+                "ynab_account": PLAID_YNAB_ACCOUNT_MAP.get(plaid_id, ""),
+                "mapped": plaid_id in PLAID_YNAB_ACCOUNT_MAP,
+                "current": balances.get("current"),
+                "available": balances.get("available"),
+                "limit": balances.get("limit"),
+                "iso_currency_code": balances.get("iso_currency_code"),
+            }
 
     store.plaid_account_balances = compact
     store.plaid_balance_sync_time = now
+    store.plaid_item_errors = errors
     return compact
 
 
@@ -1370,7 +1479,7 @@ async def primary_checking_balance_diagnostic(
         "mapped_plaid_accounts": 0,
     }
 
-    if not checking_ids or not (store.plaid_access_token or PLAID_ACCESS_TOKEN):
+    if not checking_ids or not store.plaid_items:
         return result
 
     try:
@@ -1388,8 +1497,8 @@ async def primary_checking_balance_diagnostic(
     available_count = 0
     mapped_count = 0
 
-    for plaid_id, row in balances.items():
-        ynab_alias = PLAID_YNAB_ACCOUNT_MAP.get(plaid_id)
+    for row in balances.values():
+        ynab_alias = row.get("ynab_account")
         if not ynab_alias:
             continue
         ynab_uuid = store.resolve_uuid(str(ynab_alias))
@@ -1448,6 +1557,7 @@ def plaid_account_alias(plaid_account_id: str) -> str:
 def plaid_to_external_transaction(
     transaction: dict,
     ynab_account_alias: Optional[str] = None,
+    item_id: Optional[str] = None,
 ) -> ExternalTransaction:
     posted_date = transaction.get("date")
     if not posted_date:
@@ -1458,9 +1568,11 @@ def plaid_to_external_transaction(
 
     plaid_account_id = str(transaction.get("account_id") or "")
     account_alias = ynab_account_alias or plaid_account_alias(plaid_account_id)
+    raw_transaction_id = str(transaction["transaction_id"])
+    external_id = f"{item_id}:{raw_transaction_id}" if item_id else raw_transaction_id
 
     return ExternalTransaction(
-        external_id=str(transaction["transaction_id"]),
+        external_id=external_id,
         account=account_alias,
         posted_date=date.fromisoformat(posted_date),
         authorized_date=(
@@ -1474,13 +1586,58 @@ def plaid_to_external_transaction(
     )
 
 
+def _extract_hosted_link_public_tokens(session: Dict[str, Any]) -> List[str]:
+    public_tokens: List[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, str) and value and value not in public_tokens:
+            public_tokens.append(value)
+
+    link_sessions = session.get("link_sessions") or []
+    if isinstance(link_sessions, list):
+        for link_session in link_sessions:
+            if not isinstance(link_session, dict):
+                continue
+            results = link_session.get("results") or {}
+            if not isinstance(results, dict):
+                continue
+            item_add_results = results.get("item_add_results") or []
+            if isinstance(item_add_results, list):
+                for item_result in item_add_results:
+                    if isinstance(item_result, dict):
+                        add(item_result.get("public_token"))
+
+    results = session.get("results") or {}
+    if isinstance(results, dict):
+        item_add_results = results.get("item_add_results") or []
+        if isinstance(item_add_results, list):
+            for item_result in item_add_results:
+                if isinstance(item_result, dict):
+                    add(item_result.get("public_token"))
+        legacy_tokens = results.get("public_tokens") or []
+        if isinstance(legacy_tokens, list):
+            for token in legacy_tokens:
+                add(token)
+
+    on_success = session.get("on_success") or {}
+    if isinstance(on_success, dict):
+        add(on_success.get("public_token"))
+
+    return public_tokens
+
+
 @app.post(
     "/plaid/link/hosted",
     summary="Create a Plaid Hosted Link session",
     operation_id="createPlaidHostedLink",
 )
 async def create_plaid_hosted_link(payload: PlaidHostedLinkRequest):
-    """Create a Plaid-hosted bank-linking URL; no custom frontend is required."""
+    """Create an institution-agnostic Hosted Link session.
+
+    Transactions are required because reconciliation depends on them. Additional
+    product-specific data can be added later without coupling this endpoint to
+    a named bank such as Citi, Chase, Bank of America, or Wells Fargo.
+    """
     data = await plaid_post(
         "/link/token/create",
         {
@@ -1498,131 +1655,143 @@ async def create_plaid_hosted_link(payload: PlaidHostedLinkRequest):
         "hosted_link_url": data.get("hosted_link_url"),
         "expiration": data.get("expiration"),
         "environment": PLAID_ENV,
+        "existing_item_count": len(store.plaid_items),
     }
 
 
 @app.post(
     "/plaid/link/exchange",
-    summary="Exchange a completed Hosted Link session for a Plaid Item",
+    summary="Exchange a completed Hosted Link session for one or more Plaid Items",
     operation_id="exchangePlaidHostedLink",
 )
 async def exchange_plaid_hosted_link(payload: PlaidLinkExchangeRequest):
-    """Resolve a completed Hosted Link session and exchange its public token.
+    """Resolve completed Hosted Link results and add every returned Item.
 
-    The access token is retained in runtime memory for immediate testing. For
-    durable production use, save it as PLAID_ACCESS_TOKEN in Railway (or a
-    secret-capable database). It is returned only when reveal_access_token=true.
+    Multiple institutions can coexist. Runtime connections are immediately
+    usable. For durability across Railway restarts/deploys, persist each
+    returned item_id/access_token pair in the PLAID_ITEMS_JSON secret.
     """
     session = await plaid_post(
         "/link/token/get",
         {"link_token": payload.link_token},
     )
-
-    # Current Plaid Hosted Link responses expose Item-add results per Link
-    # session at link_sessions[].results.item_add_results[].public_token.
-    # Retain legacy fallbacks for compatibility with older response shapes.
-    public_tokens: List[str] = []
-
-    def add_public_token(value: Any) -> None:
-        if isinstance(value, str) and value and value not in public_tokens:
-            public_tokens.append(value)
-
-    link_sessions = session.get("link_sessions") or []
-    if isinstance(link_sessions, list):
-        for link_session in link_sessions:
-            if not isinstance(link_session, dict):
-                continue
-            results = link_session.get("results") or {}
-            if not isinstance(results, dict):
-                continue
-            item_add_results = results.get("item_add_results") or []
-            if isinstance(item_add_results, list):
-                for item_result in item_add_results:
-                    if isinstance(item_result, dict):
-                        add_public_token(item_result.get("public_token"))
-
-    # Compatibility: accept top-level results shapes as well.
-    results = session.get("results") or {}
-    if isinstance(results, dict):
-        item_add_results = results.get("item_add_results") or []
-        if isinstance(item_add_results, list):
-            for item_result in item_add_results:
-                if isinstance(item_result, dict):
-                    add_public_token(item_result.get("public_token"))
-
-        legacy_tokens = results.get("public_tokens") or []
-        if isinstance(legacy_tokens, list):
-            for token in legacy_tokens:
-                add_public_token(token)
-
-    on_success = session.get("on_success") or {}
-    if isinstance(on_success, dict):
-        add_public_token(on_success.get("public_token"))
+    public_tokens = _extract_hosted_link_public_tokens(session)
 
     if not public_tokens:
+        link_sessions = session.get("link_sessions") or []
         session_count = len(link_sessions) if isinstance(link_sessions, list) else 0
         raise HTTPException(
             status_code=409,
             detail=(
                 "Hosted Link completed but no Item public_token was found in the "
-                "Plaid /link/token/get response. Checked "
-                "link_sessions[].results.item_add_results[], top-level "
-                "results.item_add_results[], legacy results.public_tokens, and "
-                f"on_success.public_token. link_session_count={session_count}"
-            ),
-        )
-    if len(public_tokens) != 1:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "This middleware currently expects one Plaid Item per Hosted Link "
-                "session. Create separate sessions for additional institutions."
+                "Plaid /link/token/get response. "
+                f"link_session_count={session_count}"
             ),
         )
 
-    exchanged = await plaid_post(
-        "/item/public_token/exchange",
-        {"public_token": public_tokens[0]},
-    )
-    access_token = exchanged.get("access_token") or ""
-    item_id = exchanged.get("item_id") or ""
-    if not access_token or not item_id:
-        raise HTTPException(status_code=502, detail="Plaid token exchange returned incomplete data")
+    added_items: List[Dict[str, Any]] = []
+    for public_token in public_tokens:
+        exchanged = await plaid_post(
+            "/item/public_token/exchange",
+            {"public_token": public_token},
+        )
+        access_token = str(exchanged.get("access_token") or "")
+        item_id = str(exchanged.get("item_id") or "")
+        if not access_token or not item_id:
+            raise HTTPException(
+                status_code=502,
+                detail="Plaid token exchange returned incomplete data",
+            )
 
-    store.plaid_access_token = access_token
-    store.plaid_item_id = item_id
-    store.plaid_cursor = None
-    store.plaid_transactions = {}
+        item = store.plaid_items.get(item_id) or {
+            "item_id": item_id,
+            "institution_id": "",
+            "institution_name": "",
+            "cursor": None,
+            "transactions": {},
+        }
+        item["access_token"] = access_token
+        store.plaid_items[item_id] = item
+        await hydrate_plaid_item_metadata(item)
 
-    response = {
+        row = {
+            "item_id": item_id,
+            "institution_id": item.get("institution_id") or "",
+            "institution_name": item.get("institution_name") or "",
+            "access_token_configured_in_runtime": True,
+        }
+        if payload.reveal_access_token:
+            row["access_token"] = access_token
+        added_items.append(row)
+
+    response: Dict[str, Any] = {
         "connected": True,
-        "item_id": item_id,
-        "access_token_configured_in_runtime": True,
+        "added_item_count": len(added_items),
+        "total_runtime_item_count": len(store.plaid_items),
+        "items": added_items,
         "next_step": (
-            "Persist the Item access token securely as PLAID_ACCESS_TOKEN in Railway, "
-            "then configure PLAID_YNAB_ACCOUNT_MAP."
+            "Persist every new item_id/access_token pair in the PLAID_ITEMS_JSON "
+            "Railway secret, then add desired account mappings to "
+            "PLAID_YNAB_ACCOUNT_MAP."
         ),
     }
     if payload.reveal_access_token:
-        response["access_token"] = access_token
         response["security_warning"] = (
-            "Treat access_token as a password. Store it in Railway Variables and do not "
-            "put it in source code, CustomGPT instructions, or chat history."
+            "Treat Plaid access tokens as passwords. Store them only in Railway "
+            "Variables or another secret-capable datastore; never commit them to source."
         )
     return response
 
 
 @app.get(
     "/plaid/accounts",
-    summary="List Plaid accounts for YNAB account mapping",
+    summary="List accounts across all connected Plaid institutions",
     operation_id="getPlaidAccounts",
 )
 async def get_plaid_accounts():
     balances = await refresh_plaid_account_balances(force=True)
     accounts = list(balances.values())
-    accounts.sort(key=lambda row: ((row.get("name") or "").lower(), row["plaid_account_id"]))
+    accounts.sort(
+        key=lambda row: (
+            (row.get("institution_name") or "").lower(),
+            (row.get("name") or "").lower(),
+            row["plaid_account_id"],
+        )
+    )
+
+    per_item: Dict[str, Dict[str, Any]] = {}
+    for item in plaid_items():
+        per_item[item["item_id"]] = {
+            **item,
+            "account_count": 0,
+            "mapped_account_count": 0,
+            "error": store.plaid_item_errors.get(item["item_id"], ""),
+        }
+
+    for row in accounts:
+        summary = per_item.setdefault(
+            str(row.get("item_id") or ""),
+            {
+                "item_id": row.get("item_id") or "",
+                "institution_id": row.get("institution_id") or "",
+                "institution_name": row.get("institution_name") or "",
+                "cursor_present": False,
+                "cached_transaction_count": 0,
+                "account_count": 0,
+                "mapped_account_count": 0,
+                "error": "",
+            },
+        )
+        summary["account_count"] += 1
+        if row.get("mapped"):
+            summary["mapped_account_count"] += 1
+
     return {
-        "item_id": store.plaid_item_id or PLAID_ITEM_ID,
+        "item_count": len(store.plaid_items),
+        "items": sorted(
+            per_item.values(),
+            key=lambda row: ((row.get("institution_name") or "").lower(), row["item_id"]),
+        ),
         "balance_as_of": datetime.fromtimestamp(
             store.plaid_balance_sync_time, tz=timezone.utc
         ).isoformat() if store.plaid_balance_sync_time else None,
@@ -1630,70 +1799,118 @@ async def get_plaid_accounts():
     }
 
 
-
 @app.post(
     "/plaid/sync",
-    summary="Sync Plaid Transactions and run read-only YNAB reconciliation",
+    summary="Sync all Plaid Items and run read-only YNAB reconciliation",
     operation_id="syncPlaidTransactions",
 )
 async def sync_plaid_transactions():
     await sync_ynab()
-    access_token = store.plaid_access_token or PLAID_ACCESS_TOKEN
-    if not access_token:
+    if not store.plaid_items:
         raise HTTPException(
             status_code=409,
-            detail="No Plaid access token configured; complete Plaid Link first",
+            detail="No Plaid Items configured; complete Plaid Link first",
         )
 
-    cursor = store.plaid_cursor
-    added_count = modified_count = removed_count = 0
+    total_added = total_modified = total_removed = 0
+    item_results: List[Dict[str, Any]] = []
+    all_cached: Dict[str, dict] = {}
 
-    # Plaid requires repeating /transactions/sync while has_more is true.
-    # MODIFIED/REMOVED updates are applied to a local read-only cache before
-    # reconciliation so the current external snapshot is internally consistent.
-    for _ in range(100):
-        request_body: Dict[str, Any] = {
-            "access_token": access_token,
-            "count": 500,
-        }
-        if cursor:
-            request_body["cursor"] = cursor
+    for item_id, item in list(store.plaid_items.items()):
+        access_token = str(item.get("access_token") or "")
+        if not access_token:
+            item_results.append({
+                "item_id": item_id,
+                "institution_name": item.get("institution_name") or "",
+                "success": False,
+                "error": "missing access_token",
+            })
+            continue
 
-        page = await plaid_post("/transactions/sync", request_body)
+        cursor = item.get("cursor")
+        transactions: Dict[str, dict] = item.setdefault("transactions", {})
+        added_count = modified_count = removed_count = 0
 
-        for tx in page.get("added", []):
-            tx_id = str(tx["transaction_id"])
-            store.plaid_transactions[tx_id] = tx
-            added_count += 1
+        try:
+            for _ in range(100):
+                request_body: Dict[str, Any] = {
+                    "access_token": access_token,
+                    "count": 500,
+                }
+                if cursor:
+                    request_body["cursor"] = cursor
 
-        for tx in page.get("modified", []):
-            tx_id = str(tx["transaction_id"])
-            store.plaid_transactions[tx_id] = tx
-            modified_count += 1
+                page = await plaid_post("/transactions/sync", request_body)
 
-        for removed in page.get("removed", []):
-            tx_id = str(removed.get("transaction_id") or "")
-            if tx_id:
-                store.plaid_transactions.pop(tx_id, None)
-                removed_count += 1
+                for tx in page.get("added", []):
+                    tx_id = str(tx["transaction_id"])
+                    transactions[tx_id] = tx
+                    added_count += 1
 
-        cursor = page.get("next_cursor") or cursor
-        if not page.get("has_more", False):
-            break
-    else:
-        raise HTTPException(
-            status_code=502,
-            detail="Plaid transaction sync exceeded 100 pages",
-        )
+                for tx in page.get("modified", []):
+                    tx_id = str(tx["transaction_id"])
+                    transactions[tx_id] = tx
+                    modified_count += 1
 
-    store.plaid_cursor = cursor
+                for removed in page.get("removed", []):
+                    tx_id = str(removed.get("transaction_id") or "")
+                    if tx_id:
+                        transactions.pop(tx_id, None)
+                        removed_count += 1
 
-    # Refresh mapped account balances after transaction sync. This is a small
-    # response and gives downstream affordability logic a bank-side starting point.
+                cursor = page.get("next_cursor") or cursor
+                if not page.get("has_more", False):
+                    break
+            else:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Plaid transaction sync exceeded 100 pages for Item {item_id}",
+                )
+
+            item["cursor"] = cursor
+            total_added += added_count
+            total_modified += modified_count
+            total_removed += removed_count
+
+            for tx_id, tx in transactions.items():
+                all_cached[f"{item_id}:{tx_id}"] = {
+                    **tx,
+                    "_plaid_item_id": item_id,
+                }
+
+            item_results.append({
+                "item_id": item_id,
+                "institution_name": item.get("institution_name") or "",
+                "success": True,
+                "added": added_count,
+                "modified": modified_count,
+                "removed": removed_count,
+                "cached_transaction_count": len(transactions),
+                "cursor_present": bool(cursor),
+            })
+        except HTTPException as exc:
+            item_results.append({
+                "item_id": item_id,
+                "institution_name": item.get("institution_name") or "",
+                "success": False,
+                "error": str(exc.detail),
+            })
+        except Exception as exc:
+            item_results.append({
+                "item_id": item_id,
+                "institution_name": item.get("institution_name") or "",
+                "success": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    store.plaid_transactions = all_cached
+
+    # Refresh balances after transaction sync. One broken Item will be surfaced
+    # in diagnostics without suppressing healthy institutions.
     await refresh_plaid_account_balances(force=True)
 
     mapped_account_ids = set(PLAID_YNAB_ACCOUNT_MAP.keys())
-    mapped_transactions = []
+    mapped_transactions: List[dict] = []
     skipped_unmapped_account_ids = set()
     skipped_unmapped_transaction_count = 0
 
@@ -1706,15 +1923,13 @@ async def sync_plaid_transactions():
             continue
         mapped_transactions.append(tx)
 
-    # Pass the already-validated YNAB alias explicitly. This makes the mapped
-    # account boundary authoritative here and prevents an unmapped Plaid account
-    # from reaching plaid_account_alias() during reconciliation.
     external_transactions = [
         plaid_to_external_transaction(
             tx,
             ynab_account_alias=str(
                 PLAID_YNAB_ACCOUNT_MAP[str(tx.get("account_id") or "")]
             ),
+            item_id=str(tx.get("_plaid_item_id") or ""),
         )
         for tx in mapped_transactions
     ]
@@ -1743,15 +1958,18 @@ async def sync_plaid_transactions():
 
     return {
         "plaid_sync": {
-            "added": added_count,
-            "modified": modified_count,
-            "removed": removed_count,
+            "item_count": len(store.plaid_items),
+            "successful_item_count": sum(1 for row in item_results if row.get("success")),
+            "failed_item_count": sum(1 for row in item_results if not row.get("success")),
+            "items": item_results,
+            "added": total_added,
+            "modified": total_modified,
+            "removed": total_removed,
             "cached_transaction_count": len(store.plaid_transactions),
             "mapped_transaction_count": len(mapped_transactions),
             "skipped_unmapped_transaction_count": skipped_unmapped_transaction_count,
             "skipped_unmapped_account_ids": sorted(skipped_unmapped_account_ids),
             "mapped_account_ids": sorted(mapped_account_ids),
-            "cursor_present": bool(store.plaid_cursor),
         },
         "primary_checking_balance": balance_diagnostic,
         "reconciliation": compact_reconciliation_report(
@@ -2073,13 +2291,20 @@ async def get_middleware_health():
         ynab_error = f"{type(exc).__name__}: {exc}"
 
     balance_diagnostic: Dict[str, Any] = {}
-    plaid_ok = bool(store.plaid_access_token or PLAID_ACCESS_TOKEN)
+    plaid_configured = bool(store.plaid_items)
+    plaid_ok = plaid_configured
     plaid_error = None
-    if plaid_ok and ynab_ok:
+    if plaid_configured and ynab_ok:
         try:
+            await refresh_plaid_account_balances(force=True)
             balance_diagnostic = await primary_checking_balance_diagnostic(
-                refresh_bank=True
+                refresh_bank=False
             )
+            if store.plaid_item_errors:
+                plaid_error = "; ".join(
+                    f"{item_id}: {message}"
+                    for item_id, message in sorted(store.plaid_item_errors.items())
+                )
         except Exception as exc:
             plaid_ok = False
             plaid_error = f"{type(exc).__name__}: {exc}"
@@ -2090,17 +2315,22 @@ async def get_middleware_health():
 
     mapped_accounts = len(PLAID_YNAB_ACCOUNT_MAP)
     primary_checking_ids = get_primary_checking_ids() if ynab_ok else set()
+    item_count = len(store.plaid_items)
+    readable_item_count = max(item_count - len(store.plaid_item_errors), 0)
+    all_items_readable = item_count > 0 and readable_item_count == item_count
 
     checks = {
         "ynab_read": ynab_ok,
-        "plaid_configured": bool(store.plaid_access_token or PLAID_ACCESS_TOKEN),
-        "plaid_read": plaid_ok,
+        "plaid_configured": plaid_configured,
+        "plaid_read": plaid_ok and readable_item_count > 0,
+        "plaid_all_items_readable": all_items_readable,
         "plaid_mapping_present": mapped_accounts > 0,
         "primary_checking_found": bool(primary_checking_ids),
         "bank_balance_available": bool(
             balance_diagnostic.get("bank_balance_available")
         ),
         "reconciliation_snapshot_available": reconciliation_available,
+        "multi_institution_registry_enabled": True,
         "guarded_writes_enabled": True,
     }
     healthy = all(
@@ -2109,6 +2339,7 @@ async def get_middleware_health():
             "ynab_read",
             "plaid_configured",
             "plaid_read",
+            "plaid_all_items_readable",
             "plaid_mapping_present",
             "primary_checking_found",
             "bank_balance_available",
@@ -2123,6 +2354,23 @@ async def get_middleware_health():
         "checks": checks,
         "ynab_error": ynab_error,
         "plaid_error": plaid_error,
+        "plaid": {
+            "item_count": item_count,
+            "readable_item_count": readable_item_count,
+            "failed_item_count": len(store.plaid_item_errors),
+            "items": [
+                {
+                    **item,
+                    "error": store.plaid_item_errors.get(item["item_id"], ""),
+                }
+                for item in plaid_items()
+            ],
+            "durable_multi_item_config_present": bool(PLAID_ITEMS_CONFIG),
+            "legacy_single_item_env_present": bool(
+                PLAID_ACCESS_TOKEN and PLAID_ITEM_ID
+            ),
+            "runtime_item_changes_require_persistence": True,
+        },
         "mapped_plaid_account_count": mapped_accounts,
         "primary_checking_balance": balance_diagnostic,
         "reconciliation": {
@@ -2151,7 +2399,6 @@ async def get_middleware_health():
             "explicit_commit_required": True,
         },
     }
-
 
 @app.get("/", summary="Health check", operation_id="rootHealth")
 async def root():
