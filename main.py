@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 from calendar import monthrange
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Literal, Optional
@@ -26,6 +27,8 @@ except ImportError:  # Optional unless DATABASE_URL is configured.
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
+from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
 # =====================================================================
@@ -117,10 +120,27 @@ for index, item in enumerate(PLAID_ITEMS_CONFIG):
 
 YNAB_BASE_URL = "https://api.ynab.com/v1"
 
+mcp = MCPServer(
+    "YNAB Household Budget Copilot",
+    instructions=(
+        "Budget decision-support tools backed by YNAB and Plaid. "
+        "Read current household budget context before making affordability or reallocation recommendations. "
+        "YNAB writes are proposal-based: stage changes first and commit only after explicit user approval."
+    ),
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with mcp.session_manager.run():
+        yield
+
+
 app = FastAPI(
     title="YNAB Copilot Middleware",
     description="Deterministic read-model, Plaid-backed read-only reconciliation, and guarded write layer between ChatGPT and YNAB",
     version="3.6.1",
+    lifespan=lifespan,
 )
 
 
@@ -4794,3 +4814,16 @@ async def get_policy():
     policy = load_policy()
     policy.setdefault("checking_floor", milli_to_str(CHECKING_FLOOR_MILLI))
     return policy
+
+# =====================================================================
+# MCP Streamable HTTP Transport
+# =====================================================================
+
+_mcp_http_app = mcp.streamable_http_app(
+    streamable_http_path="/mcp",
+    stateless_http=True,
+    json_response=True,
+    host="0.0.0.0",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
+app.mount("/", _mcp_http_app)
