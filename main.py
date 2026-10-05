@@ -29,6 +29,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 # =====================================================================
@@ -127,6 +128,12 @@ mcp = MCPServer(
         "Read current household budget context before making affordability or reallocation recommendations. "
         "YNAB writes are proposal-based: stage changes first and commit only after explicit user approval."
     ),
+)
+
+READ_ONLY = ToolAnnotations(
+    read_only_hint=True,
+    idempotent_hint=True,
+    open_world_hint=True,
 )
 
 
@@ -4814,6 +4821,147 @@ async def get_policy():
     policy = load_policy()
     policy.setdefault("checking_floor", milli_to_str(CHECKING_FLOOR_MILLI))
     return policy
+
+# =====================================================================
+# MCP Read-Only Tools
+# =====================================================================
+
+@mcp.tool(
+    name="getCurrentContext",
+    title="Get current household budget context",
+    description=(
+        "Get the household's current YNAB budget state. Use this first for affordability, "
+        "overspending, Ready to Assign, checking-floor, and near-term obligation questions."
+    ),
+    annotations=READ_ONLY,
+)
+async def mcp_get_current_context() -> Dict[str, Any]:
+    return await get_current_context()
+
+
+@mcp.tool(
+    name="getEnvelopeStatus",
+    title="Get current YNAB envelope status",
+    description=(
+        "Get current-month YNAB category balances, assignments, activity, policy classes, "
+        "and overspending status."
+    ),
+    annotations=READ_ONLY,
+)
+async def mcp_get_envelope_status(
+    include_zero: bool = True,
+    include_internal: bool = False,
+    class_filter: Optional[str] = None,
+) -> Dict[str, Any]:
+    return await get_envelope_status(
+        include_zero=include_zero,
+        include_internal=include_internal,
+        class_filter=class_filter,
+    )
+
+
+@mcp.tool(
+    name="getTriage",
+    title="Get actionable transaction triage",
+    description=(
+        "Get actionable YNAB transactions requiring review, including uncategorized transactions, "
+        "unapproved transactions, possible transfers, and possible duplicates. Use before transaction cleanup."
+    ),
+    annotations=READ_ONLY,
+)
+async def mcp_get_triage(
+    status: str = "actionable",
+    limit: int = 50,
+    since_days: int = 45,
+    account: Optional[str] = None,
+) -> Dict[str, Any]:
+    allowed_statuses = {
+        "actionable",
+        "needs_category",
+        "needs_approval_only",
+        "possible_transfer",
+        "possible_duplicate",
+        "unapproved",
+        "uncategorized",
+        "all",
+    }
+    if status not in allowed_statuses:
+        raise ValueError(f"status must be one of: {', '.join(sorted(allowed_statuses))}")
+    if not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    if not 1 <= since_days <= HISTORY_DAYS:
+        raise ValueError(f"since_days must be between 1 and {HISTORY_DAYS}")
+
+    return await get_triage(
+        format="json",
+        status_filter=status,
+        limit=limit,
+        since_days=since_days,
+        account=account,
+    )
+
+
+@mcp.tool(
+    name="getMerchantHistory",
+    title="Get merchant categorization history",
+    description=(
+        "Get historical category evidence for a merchant or payee. Use this before categorizing mixed merchants "
+        "such as Amazon, Target, Walmart, Sam's Club, or Costco."
+    ),
+    annotations=READ_ONLY,
+)
+async def mcp_get_merchant_history(name: str) -> Dict[str, Any]:
+    return await get_merchant_history(name=name)
+
+
+@mcp.tool(
+    name="getCashflow",
+    title="Forecast household cash flow",
+    description=(
+        "Forecast checking-account liquidity and credit-card exposure. Use the conservative liquidity view "
+        "for affordability decisions."
+    ),
+    annotations=READ_ONLY,
+)
+async def mcp_get_cashflow(days: int = 30) -> Dict[str, Any]:
+    if not 7 <= days <= 90:
+        raise ValueError("days must be between 7 and 90")
+    return await get_cashflow(days=days)
+
+
+@mcp.tool(
+    name="getFundingOptions",
+    title="Find policy-ranked funding options",
+    description=(
+        "Find policy-ranked YNAB categories that could safely fund a category shortfall or planned expense. "
+        "Protected categories are excluded by default."
+    ),
+    annotations=READ_ONLY,
+)
+async def mcp_get_funding_options(
+    target: str,
+    amount: Optional[str] = None,
+    include_protected: bool = False,
+) -> Dict[str, Any]:
+    return await get_funding_options(
+        target=target,
+        amount=amount,
+        include_protected=include_protected,
+    )
+
+
+@mcp.tool(
+    name="getPolicy",
+    title="Get household budgeting policy",
+    description=(
+        "Get the household's canonical budgeting policy, category protections, checking floor, "
+        "and reallocation priorities."
+    ),
+    annotations=READ_ONLY,
+)
+async def mcp_get_policy() -> Dict[str, Any]:
+    return await get_policy()
+
 
 # =====================================================================
 # MCP Streamable HTTP Transport
